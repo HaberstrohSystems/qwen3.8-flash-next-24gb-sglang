@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+# state the tools write next to themselves
+tools/nll/
+tools/greedy/*.json
+!tools/greedy/oa.json
+tools/logprob/*.json
+!tools/logprob/lp2.json
+tools/spec_lossless/
+tools/needle_results.tsv
+tools/bench_final/
+bench_final/
+elastic.ctl
+*.ctl.status
+!docs/logs/elastic.ctl.status
+sweep.log
+gemv/tiled_ref*.pt
+*.log
+!docs/logs/**
+*.ncontig.orig

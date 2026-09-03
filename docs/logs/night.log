@@ -1,0 +1,24 @@
+##### night start Mi 2. Sep 23:40:24 CEST 2026
+##### tree check
+  reverted
+13
+1
+##### smoothing A/B (fake-quant int4_g32 smoothed vs bf16kv)
+=== FQ_int4_g32_sm (check) ===
+  greedy after 3759 tokens: 300 tokens, mean NLL 0.7906 (decode reads the cache)
+  vs bf16kv: NLL delta +0.0022, mean|dlogprob| 0.1603, max 3.761 over the last 8561 positions
+  greedy mean NLL: ref 0.7886 now 0.7906; first divergence: 41
+##### accepted restart
+      6821       2.92         2332        57.0    200
+     10001       4.36         2291        56.5    200
+
+##### 258k spike check
+  before: S 200 S_max 200 floor 184-None arena 12.19 GB free 1.93 GB
+  prompt 257905 tokens: prefill 165.3 s (1560 tok/s), decode 52.3 tok/s
+  answer: '\n\n<think>\nThe user is asking a simple question based on the pangram "The quick b'
+  after:  S 192 S_max 192 floor 184-None arena 11.62 GB free 2.48 GB
+##### tool-call smoke
+  reasoning: The user wants me to list files in /tmp using the bash tool. This is a straightforward request. I should use a simple co
+  content:   
+  tool_calls: [{"id": "call_479a3379091f4dd8b0ece21e", "index": 0, "type": "function", "function": {"name": "bash", "arguments": "{\"command\": \"ls -la /tmp\"}"}}]
+##### local GPQA Diamond Mi 2. Sep 23:52:30 CEST 2026

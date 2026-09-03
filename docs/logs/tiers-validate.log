@@ -1,0 +1,36 @@
+##### S21_tiers validate
+=== S21_tiers bring-up ===
+[2026-09-02 20:33:24] KV lazy backing: token capacity 366976 (profiled) -> 262144 (requested 262144, safety 0.77)
+[2026-09-02 20:33:25] KV lazy backing: 262144 tokens reserved as VA, 4096 backed (floor), margin 2048, 6.8 KB/token
+=== short NLL (single chunk, write path) ===
+  overall NLL ref 1.0796  now 1.0794  delta -0.0002 nats/token
+  NLL_DELTA=-0.000247
+=== long-text NLL vs bf16 (cache read paths) ===
+  vs bf16: NLL delta +0.0071, mean|dlogprob| 0.1180, max 1.575 over the last 512 positions
+  greedy mean NLL: ref 0.7860 now 0.8992; first divergence: 10
+=== logprob oracle lp2 (10k) ===
+  LOGPROB_MAX=0.073445 LOGPROB_MEAN=0.001910
+=== streaming bench ===
+       101       0.20          509        56.2    200
+       421       0.37         1134        54.3    200
+      1701       1.11         1531        56.8    200
+      6821       3.04         2243        55.7    200
+     10001       4.40         2271        54.5    200
+=== longctx 222000 ===
+  before: S 192 S_max 192 floor 184-None arena 11.62 GB free 2.51 GB
+  prompt 257905 tokens: prefill 171.0 s (1508 tok/s), decode 51.8 tok/s
+  answer: '\n\n<think>\nThe user is asking a simple question based on the pangram "The quick b'
+  after:  S 192 S_max 192 floor 184-None arena 11.62 GB free 2.49 GB
+server alive
+##### S21_tiers all-position NLL vs bf16kv
+  vs bf16kv: NLL delta -0.0001, mean|dlogprob| 0.0743, max 1.797 over the last 8561 positions
+  greedy mean NLL: ref 0.7886 now 0.7406; first divergence: 1
+##### S21_tiers needles
+=== cur ===
+  prompt 41370 tokens, prefill 41.2 s, decode 52.7 tok/s
+  needles: Kestrel:OK Marlin:OK Basalt:OK Juniper:OK Tamarind:OK   score 5/5
+  answer: '<think>\nThe user wants me to extract the access codes for the five projects mentioned in the text. Let me find them:\n\n1. "Note: the access code for project Kestrel is 4821-QV."\n2. "Note: the access code for project Marlin is 7093-TX."\n3. "Note: the access code for project Basalt is 2617-RH."\n4. "Not'
+  prompt 247629 tokens, prefill 257.2 s, decode 50.8 tok/s
+  needles: Kestrel:OK Marlin:OK Basalt:OK Juniper:OK Tamarind:OK   score 5/5
+  answer: 'assistant\n<think>\nThe user wants me to extract the access codes for the five projects mentioned in the text. Let me find each one:\n\n- Kestrel: "Note: the access code for project Kestrel
+##### S21_tiers done

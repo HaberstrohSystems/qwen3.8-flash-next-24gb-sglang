@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use this software or the weights it serves, please cite it as below."
+type: software
+title: "Qwen3.8-Flash-Next on one 24 GB GPU: 2-bit mixed-precision serving with a patched SGLang"
+authors:
+  - family-names: Haberstroh
+    given-names: Maximilian Roland
+    affiliation: Haberstroh Systems
+    email: info@haberstroh-systems.de
+year: 2026
+date-released: 2026-09-03
+version: 1.0.0
+license: Apache-2.0
+repository-code: "https://github.com/HaberstrohSystems/qwen3.8-flash-next-24gb-sglang"
+url: "https://huggingface.co/HaberstrohSystems/Qwen3.8-Flash-Next-int2-mixed-AutoRound-24GB-SGLang"
+keywords:
+  - qwen
+  - mixture-of-experts
+  - quantization
+  - auto-round
+  - sglang
+  - long-context
