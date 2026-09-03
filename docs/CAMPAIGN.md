@@ -494,3 +494,4 @@ Benchmark: release/tools/bench_speed.py against the running server. Report decod
   So the host state (active desktop session: Chrome, VS Code, ~8 GB in swap) is the cause, not the release checkpoint;
   the three release-checkpoint attempts (hfcheck 1-3) failed the same way. The served proof of the exact upload is
   deferred to a quiet host (no browser, ideally after a fresh login); leftover processes and /dev/shm cleaned.
+- 2026-09-03 13:36 served proof of the published checkpoint: sha256 of all 12 LFS files on the Hub == local hf-release-textonly / ple (12/12 match); load test hfcheck4 from hf-release-textonly with the accepted flags (running 1, mamba 1): up after 164 s, streaming bench 101/421/1701/6821/10001 ctx -> decode 57.4/57.6/58.2/57.6/57.1 tok/s, prefill 2338 tok/s at 10001 (4.28 s). Host quiet (old session and the crash-looping vllm container stopped), pressure avg10 29 % during load. Log docs/logs/hfcheck4.log.

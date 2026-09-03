@@ -1,0 +1,14 @@
+flags: [('--max-mamba-cache-size', '2'), ('--model-path', '~/quant/hf-release-textonly'), ('--max-mamba-cache-size', '1'), ('--max-running-requests', '1')]
+  VRAM after stop: 662 MiB
+=== hfcheck4  2026-09-03T13:30:54+02:00 ===
+  up after 164 s
+  gc frozen
+   context  prefill s  prefill t/s  decode t/s tokens
+  ------------------------------------------------------
+       101       1.41           72        57.4    200
+       421       0.45          929        57.6    200
+      1701       0.80         2123        58.2    200
+      6821       2.87         2374        57.6    200
+     10001       4.28         2338        57.1    200
+
+##### hfcheck4 exit 0

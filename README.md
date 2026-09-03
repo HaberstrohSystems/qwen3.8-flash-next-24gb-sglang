@@ -182,6 +182,11 @@ per-layer table in [`patches/README.md`](patches/README.md).
 
 ## Reproducing the measurements
 
+Served proof of the published files (2026-09-03, CAMPAIGN.md entry 13:36; [`docs/logs/hfcheck4.log`](docs/logs/hfcheck4.log)): the SHA-256 of every weight file on the Hub
+matches the local release copy, and that copy, launched with `scripts/serve.sh` (one request, `int8ring_int4`),
+answered `/health` after 164 s and measured decode 57.4 / 57.6 / 58.2 / 57.6 / 57.1 tok/s at 101 / 421 / 1,701 / 6,821 /
+10,001 tokens of context and 2,338 tok/s prefill at 10,001 tokens (4.28 s).
+
 All numbers were measured on one RTX PRO 4000 Blackwell (24 GB) with 32 GB host RAM against a server
 launched with the flag set and environment of `scripts/serve.sh` (the campaign harness `scripts/sweep.sh`
 passed the same set; the concurrency flags were 1 / 1 for every headline log except `night4.log` and
