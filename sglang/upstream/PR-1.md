@@ -2,7 +2,7 @@ Base branch: qwen4-main-squashed (PR #36497). Stacked on: nothing (part 1 of 5).
 
 # fix(qwen4): CPU-offload correctness, breakable graphs, mmap PLE table
 
-Part 1/5 of the Qwen3.8-Flash-Next 24 GB serving series (RFC issue: *link*). Patch:
+Part 1/5 of the Qwen3.8-Flash-Next 24 GB serving series (RFC issue: https://github.com/sgl-project/sglang/issues/37792). Patch:
 `upstream/series-q4head/0001-fix-qwen4-CPU-offload-correctness-breakable-graphs-m.patch`
 in the companion repository (9 files, +423 / -33).
 

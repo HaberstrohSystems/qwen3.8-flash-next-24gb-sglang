@@ -2,7 +2,7 @@ Base branch: qwen4-main-squashed (PR #36497). Stacked on PR-4.
 
 # fix(spec): commit PLE state after ReplaySSM verify, NGRAM on Qwen4-Exp
 
-Part 5/5 of the Qwen3.8-Flash-Next 24 GB serving series (RFC issue: *link*). Patch:
+Part 5/5 of the Qwen3.8-Flash-Next 24 GB serving series (RFC issue: https://github.com/sgl-project/sglang/issues/37792). Patch:
 `upstream/series-q4head/0005-fix-spec-commit-PLE-state-after-ReplaySSM-verify-NGR.patch`
 in the companion repository (4 files, +542 / -3). The `spec_utils.py` change is a bug fix that
 stands on its own; the rest is an opt-in. Patch 0005 applies on `qwen4-main-squashed`

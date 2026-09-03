@@ -2,7 +2,7 @@ Base branch: qwen4-main-squashed (PR #36497). Stacked on PR-1.
 
 # feat(moe_wna16): 2-bit experts, expert streaming, N-contiguous GEMV
 
-Part 2/5 of the Qwen3.8-Flash-Next 24 GB serving series (RFC issue: *link*). Patch:
+Part 2/5 of the Qwen3.8-Flash-Next 24 GB serving series (RFC issue: https://github.com/sgl-project/sglang/issues/37792). Patch:
 `upstream/series-q4head/0002-feat-moe_wna16-2-bit-experts-expert-streaming-N-cont.patch`
 in the companion repository (9 files, +1,583 / -33). Nothing in this part is Qwen4-specific.
 

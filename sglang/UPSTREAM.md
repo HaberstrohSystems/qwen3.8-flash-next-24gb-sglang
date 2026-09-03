@@ -5,6 +5,16 @@ serving patch is the five-commit series under [`upstream/`](upstream/); the flat
 [`qwen4exp-serving-73a255206f.patch`](qwen4exp-serving-73a255206f.patch) is the verbatim served
 diff and stays as the reproduction artifact ([`PATCH_NOTES.md`](PATCH_NOTES.md)).
 
+## Status (2026-09-03)
+
+Posted to `sgl-project/sglang`: RFC issue [#37792](https://github.com/sgl-project/sglang/issues/37792);
+pull requests against `qwen4-main-squashed`: [#37793](https://github.com/sgl-project/sglang/pull/37793) (part 1),
+[#37794](https://github.com/sgl-project/sglang/pull/37794) (part 5, standalone `spec_utils.py` fix),
+[#37796](https://github.com/sgl-project/sglang/pull/37796) (part 2, draft), [#37797](https://github.com/sgl-project/sglang/pull/37797) (part 3, draft),
+[#37798](https://github.com/sgl-project/sglang/pull/37798) (part 4, draft). Branches live in the fork
+[HaberstrohSystems/sglang](https://github.com/HaberstrohSystems/sglang) (`q4-pr1` .. `q4-pr5`, `q4-pr5-alone`,
+`qwen4exp-24gb-serving-q4head`, reference `qwen4exp-24gb-serving`).
+
 ## Review target: `qwen4-main-squashed`, not `main`
 
 Qwen3.8-Flash-Next support is not on SGLang `main`. It lives in the open PR #36497 "Introduce

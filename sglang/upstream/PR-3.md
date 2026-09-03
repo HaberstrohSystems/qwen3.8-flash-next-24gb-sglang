@@ -2,7 +2,7 @@ Base branch: qwen4-main-squashed (PR #36497). Stacked on PR-2.
 
 # feat(mem_cache): elastic VMM expert row arenas and lazy KV backing
 
-Part 3/5 of the Qwen3.8-Flash-Next 24 GB serving series (RFC issue: *link*). Patch:
+Part 3/5 of the Qwen3.8-Flash-Next 24 GB serving series (RFC issue: https://github.com/sgl-project/sglang/issues/37792). Patch:
 `upstream/series-q4head/0003-feat-mem_cache-elastic-VMM-expert-row-arenas-and-laz.patch`
 in the companion repository (8 files, +1,070). General in design; the expert side is wired to
 the `moe_wna16` word layout and address tables of part 2.

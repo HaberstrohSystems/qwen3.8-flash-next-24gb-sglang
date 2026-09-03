@@ -2,7 +2,7 @@ Base branch: qwen4-main-squashed (PR #36497). Stacked on PR-3.
 
 # feat(qsa): quantized KV pools with dequant-on-gather (fp8/int8/int4)
 
-Part 4/5 of the Qwen3.8-Flash-Next 24 GB serving series (RFC issue: *link*). Patch:
+Part 4/5 of the Qwen3.8-Flash-Next 24 GB serving series (RFC issue: https://github.com/sgl-project/sglang/issues/37792). Patch:
 `upstream/series-q4head/0004-feat-qsa-quantized-KV-pools-with-dequant-on-gather-f.patch`
 in the companion repository (14 files, +4,424 / -25). The pool classes are general; the read
 path is specific to the Qwen sparse attention backend.
