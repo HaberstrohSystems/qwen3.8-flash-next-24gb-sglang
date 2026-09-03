@@ -486,3 +486,11 @@ Benchmark: release/tools/bench_speed.py against the running server. Report decod
 - 2026-09-03 09:45 session handoff: user keeps the new repo name; asks for a fresh session that reviews the model card
   against other cards for professionalism. Plan + state in perf/NEXT_SESSION.md. hfcheck2.sh runs nohup (survives).
 - 2026-09-03 09:03 (wall clock; the four entries above carry estimated times, real order is correct) checkpoint upload: hashed 17/17, uploading at ~5 MB/s single-stream, ETA ~2 h; then hfcheck2.sh runs the load test.
+- 2026-09-03 10:33 checkpoint upload stalled at ~46 KB/s with ~99 % transferred (xet dedup keeps uploaded chunks); uploader restarted.
+- 2026-09-03 10:45 checkpoint upload complete: 17/17 files committed under the new repo name.
+- 2026-09-03 10:50 release-checkpoint load test #2 (hfcheck2, host quiet except the user's desktop + Chrome): weights loaded, oomd kill at the elastic arena init (pressure avg10 72 %). Retry #3 running (hfcheck3). The checkpoint content is verified by index/key checks; a served proof of the exact upload is still open.
+- 2026-09-03 11:00 control start from the SERVED directory (restart #24, same flags): came up, answered the bench (101 ctx
+  35.5 tok/s, 421 ctx 57.9, 1701 ctx 18.8 tok/s at 94 tok/s prefill = heavy host paging), then oomd-killed at 10:51:50.
+  So the host state (active desktop session: Chrome, VS Code, ~8 GB in swap) is the cause, not the release checkpoint;
+  the three release-checkpoint attempts (hfcheck 1-3) failed the same way. The served proof of the exact upload is
+  deferred to a quiet host (no browser, ideally after a fresh login); leftover processes and /dev/shm cleaned.

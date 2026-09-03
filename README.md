@@ -107,7 +107,7 @@ Pointers: the patch is in [`sglang/`](sglang/), reproduction of every headline n
 
 | Path | Contents |
 |---|---|
-| [`sglang/`](sglang/) | The serving patch against SGLang `73a255206f` ([`qwen4exp-serving-73a255206f.patch`](sglang/qwen4exp-serving-73a255206f.patch)), its per-file notes with verification ([`PATCH_NOTES.md`](sglang/PATCH_NOTES.md)) and the upstream contribution plan ([`UPSTREAM.md`](sglang/UPSTREAM.md)). |
+| [`sglang/`](sglang/) | The serving patch against SGLang `73a255206f` ([`qwen4exp-serving-73a255206f.patch`](sglang/qwen4exp-serving-73a255206f.patch)), its per-file notes with verification ([`PATCH_NOTES.md`](sglang/PATCH_NOTES.md)), the upstream status ([`UPSTREAM.md`](sglang/UPSTREAM.md)) and, under [`sglang/upstream/`](sglang/upstream/), the reviewable five-commit series (`series-q4head/`, `series-base/`), the RFC issue text and the PR descriptions. |
 | [`patches/`](patches/) | The layered patch scripts (`apply` / `revert` / `--check`) the served tree was built from, the original base patch, and [`patches/README.md`](patches/README.md) with layering order, the status of every layer and the packaging notes. |
 | [`gemv/`](gemv/) | Kernels and unit tests: int2 GEMV, the VMM row arena, the elastic expert cache, KV pool tests, n-gram chain test. |
 | [`tools/`](tools/) | Measurement tools: streaming bench, logprob oracle, NLL tests, needle and long-context tests, elastic sweep. |
@@ -150,8 +150,8 @@ management. Mechanisms, in the order they were built:
   the one eager break; capture 3.97 s / 0.12 GB (CAMPAIGN.md:102, :291).
 * **Elastic expert cache** (`gemv/row_arena.py`, `gemv/expert_elastic.py`, `patches/elastic.py`).
   Every (layer, tensor kind) keeps its expert rows in a CUDA VMM arena in routing-mass rank order;
-  growing gathers rows from host slots, shrinking copies the tail back and unmaps 2 MiB granules, so
-  VRAM really returns to the driver while every address stays fixed and captured graphs stay valid. S
+  growing gathers rows from host slots, shrinking copies the tail back and unmaps 4 MiB chunks (aligned to
+  the 2 MiB device granularity), so VRAM really returns to the driver while every address stays fixed and captured graphs stay valid. S
   is a live dial through the `SGLANG_MOE_ELASTIC_CTL` file (`tools/elastic_sweep.py`).
 * **Lazy VMM KV cache** (`patches/kv_lazy.py`). The KV cache is reserved as address space for
   262,144 tokens and backed in 2,048-token steps as pages are handed out; at idle the backing beyond a
@@ -209,7 +209,9 @@ under CPU offload; 2-bit `moe_wna16` with expert streaming and the in-place GEMV
 elasticity; quantized KV pools with dequant-on-gather; NGRAM speculation on PLE models). The plan, what
 is general and what is Qwen4-Exp-specific, and the hunks that are measurement aids and do not go
 upstream are in [`sglang/UPSTREAM.md`](sglang/UPSTREAM.md) and
-[`sglang/PATCH_NOTES.md`](sglang/PATCH_NOTES.md) section 5.
+[`sglang/PATCH_NOTES.md`](sglang/PATCH_NOTES.md) section 5. The series itself (`git am` patches
+against the head of `qwen4-main-squashed` and against the served base), the RFC issue text and
+the five PR descriptions are in [`sglang/upstream/`](sglang/upstream/).
 
 ## Hardware and software requirements
 

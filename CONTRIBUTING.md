@@ -36,7 +36,8 @@ license as well.
 
 Changes to SGLang itself belong upstream. `sglang/UPSTREAM.md` is the plan for that: which parts are
 general and which are Qwen4-Exp-specific, the split into reviewable commits, and what an upstream
-version still needs. A fix that lands in SGLang should be removed from the patch here, with a note in
+version still needs; the reviewable series, the RFC issue text and the PR descriptions are in
+`sglang/upstream/`. A fix that lands in SGLang should be removed from the patch here, with a note in
 `sglang/PATCH_NOTES.md`.
 
 ## Measurement rules

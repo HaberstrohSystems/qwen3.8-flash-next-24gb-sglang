@@ -29,6 +29,7 @@ notes live in [`../sglang/`](../sglang/). What was rejected, and why, is collect
 | [`logs/elastic.ctl.status`](logs/elastic.ctl.status) | The elastic expert cache's status file at 00:36:50 (restart #23, 8 GDN state slots): S = 184 on all 48 layers, arena 11.062 GiB (11.88 GB), 2.084 GiB free, 84.3 % routing mass covered; the file's `_GB` suffix means bytes / 2**30 | 2026-09-03 00:36 |
 | [`logs/needle_results.tsv`](logs/needle_results.tsv) | Needle test rows: time, tag, tokens, score, hits, prefill s, decode tok/s | 2026-09-02 |
 | [`logs/MOE-IO-DIFF.txt`](logs/MOE-IO-DIFF.txt) | The per-layer MoE input/output A/B that settled the S9 numerics question (word layout vs byte layout; CAMPAIGN.md:92-96) | 2026-09-02 11:24 |
+| [`logs/probe_trtllm_sm120.log`](logs/probe_trtllm_sm120.log) | Output of `tools/probe_trtllm_sm120.py`: FlashInfer's `trtllm_batch_decode_with_kv_cache` (the SM120 sparse-decode route of `qwen4-main-squashed` since #36806) at the QSA backend's shapes against a torch softmax reference; max relative error 3.9e-3 / 2.5e-3 / 2.5e-3, no NaN (`../sglang/UPSTREAM.md`) | 2026-09-03 10:29 |
 
 `night2-4.log` show the startup transient after a restart (CAMPAIGN.md:306, :336); the accepted numbers
 are those of `tiers-validate.log`.

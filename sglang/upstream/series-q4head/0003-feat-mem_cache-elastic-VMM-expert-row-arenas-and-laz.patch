@@ -1,0 +1,1350 @@
+From 5563e859082e623d0c5f2d568e78673a0da4e59f Mon Sep 17 00:00:00 2001
+From: Maximilian Roland Haberstroh <info@haberstroh-systems.de>
+Date: Thu, 3 Sep 2026 09:03:06 +0200
+Subject: [PATCH 3/5] feat(mem_cache): elastic VMM expert row arenas and lazy
+ KV backing
+
+## Motivation
+
+On a 24 GB card that also has to hold a 2-bit MoE, VRAM is shared between
+resident expert rows and the KV cache, and the split that is right for a
+short chat is wrong for a 256k-token prompt. Two facts make a static split
+unnecessary: expert weights are immutable, so an expert's GPU residency is
+a pure cache (eviction = table write, admission = one row copy + table
+write); and SGLang already keeps the KV cache in a CUDA VMM arena
+(`KvVmmBufferOwner`), but commits it monotonically at startup
+(`CAMPAIGN.md` design note 2026-09-02 12:40). Host RAM is the wall on the
+reference machine (RTX PRO 4000 Blackwell 24 GB, 32 GB host RAM): 31
+offloaded layers pin 24-26 GB of the 32 GB, so no host mirror can be added
+at runtime (`CAMPAIGN.md` 2026-09-02 12:49; model card, "Scope and
+limitations").
+
+Measurements and logs: https://github.com/HaberstrohSystems/qwen3.8-flash-next-24gb-sglang
+(`docs/CAMPAIGN.md`, an append-only log cited below by its dated entries;
+`docs/ELASTIC_MEMORY.md`; `tools/bench_speed.py`) and the model card
+https://huggingface.co/HaberstrohSystems/Qwen3.8-Flash-Next-int2-mixed-AutoRound-24GB-SGLang
+(cited by section name).
+
+## Modifications
+
+Elastic expert cache (`SGLANG_MOE_ELASTIC=1`, wired to the placement pass
+of part 2):
+
+* `layers/moe/row_arena.py` (new): `RowArena` reserves virtual address
+  space for `max_rows` once (`cuMemAddressReserve`) and backs a rank-ordered
+  prefix with physical chunks on demand (`cuMemCreate` + `cuMemMap`,
+  4 MiB chunks aligned to the 2 MiB device granularity). Shrinking is a
+  tail unmap that really returns the memory to the driver while every row
+  address stays fixed for the process lifetime, so kernels that read rows
+  through an address table, and CUDA graphs that captured them, need no
+  recapture. Uses the driver plumbing in `cuda_vmm_utils`. The module's
+  former `__main__` self-test is replaced by the registered unit test
+  below.
+* `layers/moe/expert_elastic.py` (new): one arena per (layer, tensor kind)
+  in routing-mass rank order; the int64 table `addr[e]` points into the
+  arena for rank(e) < S and at the row's pinned host slot otherwise. Grow =
+  table-driven host -> arena gather + table rewrite; shrink = D2H copy of
+  the tail ranks into pool slots + table rewrite + unmap. Host memory is
+  conserved through a slot pool (a host layer's hot rows vacate their
+  slots, a GPU layer's cold rows take them); `free()` never pins at
+  runtime, so S_floor is what the pool can absorb (184 rows per layer on
+  the reference machine; `SGLANG_MOE_ELASTIC_PIN_MB` grants a pinned
+  fallback budget, `SGLANG_MOE_ELASTIC_FILL_MB` / `_RESERVE_ROWS` steer the
+  startup fill). A control file (`SGLANG_MOE_ELASTIC_CTL`: `S <n>`,
+  `fill <MB>`, `free <MB>`, `status`) is polled from the MoE apply path
+  outside graph replay and writes a status file.
+* `test/registered/unit/layers/moe/test_row_arena.py` (new,
+  `register_cuda_ci`, ~150 MB of VRAM): arena geometry (chunk / VA
+  alignment, `chunks_for_rows`, `bytes_to_reach`, `rows_for_bytes`);
+  `ensure_rows` backs a prefix and driver-free memory drops by exactly the
+  mapped bytes; a Triton gather through an address table that mixes arena
+  and pinned-host rows reads every row; a CUDA graph captured against the
+  arena addresses replays after `shrink_rows` (memory returned, evicted
+  rows repointed to the host row) and after growing back; `close` returns
+  the memory; `ArenaOOM` is raised when a chunk cannot be created.
+
+Lazy KV backing (`SGLANG_KV_LAZY=1`):
+
+* `mem_cache/kv_vmm_backing.py`: `KvVmmArena.uncommit_beyond`,
+  `KvVmmBufferOwner.release_beyond`, `backed_tokens`, `bytes_per_token`.
+* `mem_cache/memory_pool.py`: with `SGLANG_KV_LAZY=1` the full-attention
+  pool is allocated through the VMM owner in the classic flow as well, with
+  `SGLANG_KV_LAZY_FLOOR` (4096) tokens backed at start. `lazy_ensure`
+  commits in `SGLANG_KV_LAZY_MARGIN` (2048) token steps as pages are handed
+  out and keeps `SGLANG_KV_LAZY_HEADROOM_MB` (1536) driver-free after every
+  commit: below the watermark it shrinks the expert cache first (through
+  `ExpertElastic.free`), and `empty_cache()` is only forced when the cache
+  can still shrink, otherwise rate-limited to once per 30 s. `lazy_release`
+  unmaps beyond the floor when the pool goes idle and regrows the expert
+  cache at that point (no forward in flight).
+* `mem_cache/allocator/paged.py`, `allocator/token.py`: `_lazy_hook`
+  before pages are consumed; an allocation whose commit fails returns
+  `None` (refused) instead of crashing; `_lazy_idle_check` in
+  `_release_page_ids` / `free`.
+* `mem_cache/kv_cache_configurator.py`: virtual capacity
+  `SGLANG_KV_LAZY_TOKENS` above the profiled value, admitted capacity
+  `min(requested, SGLANG_KV_LAZY_SAFETY x profiled)` (default 0.85), so a
+  prompt that could not be backed is refused at admission.
+
+All switches are environment variables in this part; server arguments,
+a registered callback instead of the `ExpertElastic` import inside
+`lazy_ensure`, and an HTTP endpoint instead of the control file are the
+obvious follow-ups. Known limits: `lazy_release` fires when the whole pool
+is idle (validated at `--max-running-requests 1`); the scheduler does not
+survive `alloc_extend` returning `None` mid-prefill, which is why the
+admission cap exists (`CAMPAIGN.md` 2026-09-02 14:56 and 14:58).
+
+## Accuracy Tests
+
+Both mechanisms move bytes without changing values; the exactness oracle
+(teacher-forced logprobs on the 10k prompt, model card, "Serving
+fidelity") confirms it: elastic cache max 0.060 / mean 0.0016
+(`CAMPAIGN.md` 2026-09-02 13:17); lazy KV max 0.057 / mean 0.0014
+(2026-09-02 13:42); 128k configuration mean 0.0021 (2026-09-02 13:53).
+
+`test_row_arena.py` on the idle GPU (3 tests pass; run as
+`PYTHONPATH=python python test/registered/unit/layers/moe/test_row_arena.py`
+with ninja and an nvcc that supports the GPU architecture on PATH):
+2 MiB granularity, `ensure_rows(184)` maps 36 MiB, `shrink_rows(64)`
+returns 20 MiB to the driver (`mem_get_info` confirms), a CUDA graph
+captured against arena addresses replays correctly after shrink and after
+regrow, `ArenaOOM` raised cleanly (the same steps as the original
+self-test, `CAMPAIGN.md` 2026-09-02 12:44).
+
+## Speed Tests and Profiling
+
+Streaming bench, single request, ~10k context (`tools/bench_speed.py`;
+model card, "Performance"):
+
+* elastic expert cache: decode 56.2 tok/s, prefill 2335 tok/s (the
+  previous configuration measured 56.0 / 2362 after the bench measurement
+  fix of 2026-09-02 12:58; 13:17). Live S sweep without restart:
+  S=184 arena 11.06 GB, 1.73 GB free, 84.3 % of routing mass, decode
+  56-57.6; S=200 12.19 GB / 0.62 GB free / 86.7 % / 55.6-57.9: the dial
+  buys +2-3 % decode per ~1.7 GB, its value is VRAM on demand for the KV
+  cache (14:20).
+* lazy KV: decode 55.4 / prefill 2323 (13:42); the log shows 288 MB
+  backed at 10k tokens (24 KB/token bf16) and release to the 4096-token
+  floor (144 MB) at idle (14:45); KV committed at startup 0.8 GB -> 0.1 GB
+  (`ELASTIC_MEMORY.md`, "Result").
+* 128k context: decode 55.0-57.5, prefill 2270-2340 re-measured on the
+  live server (13:53).
+* watermark rule: a 60k-token prompt first crashed because every commit
+  ate the prefill's working memory (driver free 0.07 GB; 13:55); with the
+  headroom rule a 68,905-token bf16 prompt ran at prefill 48.9 s
+  (1408 tok/s), decode 53.3 tok/s, expert cache 192 -> 184 during the
+  request and regrown afterwards (14:54).
+* rate-limited `empty_cache`: 257,905-token prompt (tiered pool of
+  part 4) prefill 171.0 s -> 165.3 s (1508 -> 1560 tok/s), decode 52.3
+  (2026-09-02 22:19; 2026-09-03 00:55).
+
+Part 3/5 of the Qwen3.8-Flash-Next 24 GB serving series; stacked on part 2.
+---
+ .../sglang/srt/layers/moe/expert_elastic.py   | 489 ++++++++++++++++++
+ python/sglang/srt/layers/moe/row_arena.py     | 173 +++++++
+ .../sglang/srt/mem_cache/allocator/paged.py   |  32 ++
+ .../sglang/srt/mem_cache/allocator/token.py   |  21 +
+ .../srt/mem_cache/kv_cache_configurator.py    |  18 +
+ python/sglang/srt/mem_cache/kv_vmm_backing.py |  54 ++
+ python/sglang/srt/mem_cache/memory_pool.py    | 105 ++++
+ .../unit/layers/moe/test_row_arena.py         | 178 +++++++
+ 8 files changed, 1070 insertions(+)
+ create mode 100644 python/sglang/srt/layers/moe/expert_elastic.py
+ create mode 100644 python/sglang/srt/layers/moe/row_arena.py
+ create mode 100644 test/registered/unit/layers/moe/test_row_arena.py
+
+diff --git a/python/sglang/srt/layers/moe/expert_elastic.py b/python/sglang/srt/layers/moe/expert_elastic.py
+new file mode 100644
+index 0000000000..7a2c11b487
+--- /dev/null
++++ b/python/sglang/srt/layers/moe/expert_elastic.py
+@@ -0,0 +1,489 @@
++"""Elastic expert residency: a resizable, rank-ordered GPU cache of MoE expert rows.
++
++Every (layer, tensor kind) keeps its expert rows in a RowArena on the GPU, in routing-mass
++order (rank 0 = hottest). The int64 address table addr[e] points either into the arena
++(rank(e) < S) or at the row's home slot in pinned host memory. Growing S gathers the next
++ranks from their host slots straight into the arena (table-driven gather kernel, no staging),
++rewrites their table entries and returns the host slots to a pool. Shrinking S copies the
++tail ranks back into pool slots, rewrites the table, then unmaps the arena tail so the VRAM
++really returns to the driver. Values never change, only where they live; the decode GEMV and
++the prefill gather read through the tables and never notice. CUDA graphs captured against
++the tables stay valid because arena addresses are fixed for the process lifetime.
++
++Host memory is conserved: rows off the GPU always own a host slot. Slots come from the
++offloaded layers' pinned tensors (a host layer's hot rows vacate their slots). With 31 host
++layers of 512 rows and 48 layers, the pool is empty at S = 181, so S_floor is 184 unless a
++pinned fallback budget is granted (SGLANG_MOE_ELASTIC_PIN_MB).
++
++Control (poll() is called from the MoE apply path, prefill/eager only):
++    SGLANG_MOE_ELASTIC_CTL=/path/ctl      one command per write:
++        S <n>            set every layer to S = n (clamped to [S_floor, 512])
++        fill <MB>        grow all layers, keeping <MB> of VRAM free
++        free <MB>        shrink all layers until at least <MB> of VRAM is free
++        status           write the status file only
++    <ctl>.status is rewritten after every command (per-layer S, arena bytes, free VRAM).
++"""
++
++import logging
++import os
++import time
++
++import torch
++
++from sglang.srt.layers.moe.row_arena import ArenaOOM, RowArena
++
++logger = logging.getLogger(__name__)
++NAMES = ("w13_qweight", "w2_qweight", "w13_scales", "w2_scales")
++
++
++def _gather(tab, ids, out_rows_u8, row_bytes):
++    """out_rows_u8[i] <- row at tab[ids[i]] (GPU or pinned host address)."""
++    import triton
++
++    from sglang.srt.layers.moe.expert_stream import _gather_rows_tab_kernel
++
++    BLOCK = 1024
++    _gather_rows_tab_kernel[(int(ids.numel()), triton.cdiv(row_bytes, BLOCK))](
++        tab, ids, out_rows_u8, row_bytes, BLOCK=BLOCK
++    )
++
++
++class _Kind:
++    __slots__ = ("name", "arena", "tab", "home", "tail", "dtype", "rb", "keep")
++
++    def __init__(self, name, arena, tab, home, tail, dtype, rb, keep):
++        self.name, self.arena, self.tab, self.home = name, arena, tab, home
++        self.tail, self.dtype, self.rb, self.keep = tail, dtype, rb, keep
++
++
++class _Layer:
++    __slots__ = ("layer", "lid", "E", "S", "kinds")
++
++    def __init__(self, layer, lid, E, S):
++        self.layer, self.lid, self.E, self.S, self.kinds = layer, lid, E, S, {}
++
++
++class ExpertElastic:
++    inst = None
++
++    def __init__(self, mass: torch.Tensor, S0: int, device="cuda"):
++        self.mass = mass.float()  # [L, E] routing mass
++        self.L, self.E = mass.shape
++        self.order = torch.argsort(
++            self.mass, dim=1, descending=True
++        )  # [L, E] rank -> expert
++        self.rank = torch.empty_like(self.order)
++        self.rank.scatter_(1, self.order, torch.arange(self.E).expand(self.L, -1))
++        self.S0 = int(S0)
++        self.device = device
++        self.layers = {}  # lid -> _Layer
++        self.pool = {n: [] for n in NAMES}  # free host slots (tensor, row)
++        self.pin_budget = int(os.environ.get("SGLANG_MOE_ELASTIC_PIN_MB", "0")) << 20
++        self.pin_used = 0
++        self._pinned_keep = []
++        self._serving = False  # flips after placement
++        self.reserve_rows = int(os.environ.get("SGLANG_MOE_ELASTIC_RESERVE_ROWS", "0"))
++        self.ctl = os.environ.get("SGLANG_MOE_ELASTIC_CTL")
++        self._ctl_mtime = (
++            os.stat(self.ctl).st_mtime if self.ctl and os.path.exists(self.ctl) else 0.0
++        )  # ignore stale commands
++        _af = os.environ.get(
++            "SGLANG_MOE_ELASTIC_FILL_MB"
++        )  # reserve to keep free; unset = no autofill
++        self._autofill = int(_af) if _af else None
++        self.regrow_reserve = (
++            int(_af) if _af else 768
++        )  # after a forced shrink, grow back to this
++        self.pending_regrow = False
++        self._calls = 0
++        ExpertElastic.inst = self
++
++    # ------------------------------------------------------------------ slots
++    def _pin_rows(self, name, need, tail, dtype, why):
++        """Allocate pinned host slots. STARTUP ONLY: on a box with ~26 GB pinned and ~2 GB free a
++        runtime cudaHostAlloc stalls the kernel for tens of seconds (reclaim + compaction).
++        """
++        nbytes = (
++            need
++            * int(torch.empty(0, dtype=dtype).element_size())
++            * int(torch.Size(tail).numel())
++        )
++        if self.pin_used + nbytes > self.pin_budget:
++            raise RuntimeError(
++                f"elastic: pinned budget exhausted for {name} ({why}); "
++                f"SGLANG_MOE_ELASTIC_PIN_MB={self.pin_budget >> 20}, used {self.pin_used >> 20} MB"
++            )
++        extra = torch.empty((need,) + tuple(tail), dtype=dtype, pin_memory=True)
++        self.pin_used += nbytes
++        self.pool[name].extend((extra, i) for i in range(need))
++        self._pinned_keep.append(extra)
++        logger.info(
++            "elastic: pinned %d rows of %s (%.0f MB) [%s]",
++            need,
++            name,
++            nbytes / 1e6,
++            why,
++        )
++
++    def _take_slots(self, name, n, tail, dtype):
++        pool = self.pool[name]
++        if len(pool) < n:
++            if self._serving:
++                raise RuntimeError(
++                    f"elastic: host slot pool for {name} exhausted ({len(pool)} < {n}) "
++                    f"and runtime pinning is disabled (raise SGLANG_MOE_ELASTIC_RESERVE_ROWS)"
++                )
++            self._pin_rows(name, n - len(pool), tail, dtype, "startup shortfall")
++        return [pool.pop() for _ in range(n)]
++
++    @staticmethod
++    def _slot_addr(slot, rb):
++        t, r = slot
++        return t.data_ptr() + r * rb
++
++    # ------------------------------------------------------------------ init
++    def add_layer(self, layer):
++        """Move one FusedMoE layer into arenas + tables. Host layers donate slots, GPU layers
++        consume them: call in an interleaved order (see place_all)."""
++        lid = int(layer.layer_id)
++        E = int(layer.w13_qweight.data.shape[0])
++        S = min(self.S0, E)
++        st = _Layer(layer, lid, E, S)
++        order = self.order[lid]
++        hot = order[:S]
++        cold = order[S:]
++        addr, proto = {}, {}
++        for name in NAMES:
++            p = getattr(layer, name, None)
++            if p is None:
++                continue
++            t = p.data
++            tail, dtype = tuple(t.shape[1:]), t.dtype
++            rb = t[0].numel() * t.element_size()
++            arena = RowArena(
++                rb, E, torch.device(self.device).index or 0, name=f"L{lid}.{name}"
++            )
++            arena.ensure_rows(S)
++            view = arena.view(S, tail, dtype)
++            tab = torch.empty(E, dtype=torch.int64)
++            home = [None] * E
++            keep = []
++            if t.is_cuda:
++                view.copy_(t.index_select(0, hot.to(t.device)))
++                slots = self._take_slots(name, int(cold.numel()), tail, dtype)
++                cold_cpu = t.index_select(0, cold.to(t.device)).cpu()
++                for i, e in enumerate(cold.tolist()):
++                    dst, r = slots[i]
++                    dst[r].copy_(cold_cpu[i])
++                    home[e] = slots[i]
++                    tab[e] = self._slot_addr(slots[i], rb)
++                    keep.append(dst)
++                del cold_cpu
++            else:
++                src_tab = (t.data_ptr() + torch.arange(E, dtype=torch.int64) * rb).to(
++                    self.device
++                )
++                _gather(
++                    src_tab, hot.to(self.device), view.view(torch.uint8).view(S, -1), rb
++                )
++                for e in cold.tolist():
++                    home[e] = (t, e)
++                    tab[e] = t.data_ptr() + e * rb
++                self.pool[name].extend((t, e) for e in hot.tolist())
++                keep.append(t)
++            tab[hot] = arena.base + self.rank[lid][hot] * rb
++            tab = tab.to(self.device)
++            st.kinds[name] = _Kind(name, arena, tab, home, tail, dtype, rb, keep)
++            p.data = view
++            addr[name] = tab
++            proto[name] = view
++            del t
++        torch.cuda.synchronize()
++        torch.cuda.empty_cache()
++        layer._placed = {"addr": addr, "proto": proto, "E": E, "S": S, "keep": []}
++        layer._gemv_tabs = None
++        self.layers[lid] = st
++
++    def place_all(self, layers):
++        """Deferred pass over all layers. Host kinds donate slots, GPU kinds consume 512-S each;
++        a layer is placed once every pool it will draw from can serve it (the offloader may
++        split a layer: some kinds on the host, some on the GPU)."""
++
++        def need(l):
++            return {
++                n: (self.E - self.S0 if getattr(l, n).data.is_cuda else 0)
++                for n in NAMES
++                if getattr(l, n, None) is not None
++            }
++
++        donors = [l for l in layers if not any(need(l).values())]
++        takers = [l for l in layers if any(need(l).values())]
++        placed = 0
++        while donors or takers:
++            ready = next(
++                (
++                    l
++                    for l in takers
++                    if all(len(self.pool[n]) >= k for n, k in need(l).items())
++                ),
++                None,
++            )
++            if ready is not None:
++                takers.remove(ready)
++                self.add_layer(ready)
++            elif donors:
++                self.add_layer(donors.pop(0))
++            else:  # pool short: pinned fallback (or a clear error)
++                self.add_layer(takers.pop(0))
++            placed += 1
++        if (
++            self.reserve_rows
++        ):  # one-time reserve so shrinking below S0 never pins at runtime
++            for name in NAMES:
++                k = next(
++                    (
++                        k
++                        for st in self.layers.values()
++                        for k in st.kinds.values()
++                        if k.name == name
++                    ),
++                    None,
++                )
++                if k is not None:
++                    self._pin_rows(
++                        name, self.reserve_rows, k.tail, k.dtype, "startup reserve"
++                    )
++        self._serving = True
++        logger.info(
++            "elastic placement: %d layers at S=%d, free slots %s, VRAM free %.2f GB",
++            placed,
++            self.S0,
++            {n: len(v) for n, v in self.pool.items()},
++            torch.cuda.mem_get_info()[0] / 2**30,
++        )
++        self.write_status()
++
++    # ------------------------------------------------------------------ resize
++    def resize_layer(self, lid, S_new):
++        st = self.layers[lid]
++        S = st.S
++        S_new = max(0, min(int(S_new), st.E))
++        if S_new == S:
++            return
++        order = self.order[lid]
++        torch.cuda.synchronize()
++        if S_new > S:
++            ids = order[S:S_new]
++            for k in st.kinds.values():
++                try:
++                    k.arena.ensure_rows(S_new)
++                except ArenaOOM:
++                    for k2 in st.kinds.values():
++                        k2.arena.shrink_rows(S)
++                    raise
++            for k in st.kinds.values():
++                view = k.arena.view(S_new, k.tail, k.dtype)
++                dst = view.view(torch.uint8).view(S_new, -1)[S:S_new]
++                _gather(k.tab, ids.to(self.device), dst, k.rb)
++            torch.cuda.synchronize()
++            for k in st.kinds.values():
++                k.tab[ids.to(self.device)] = (
++                    k.arena.base + torch.arange(S, S_new, dtype=torch.int64) * k.rb
++                ).to(self.device)
++                for e in ids.tolist():
++                    self.pool[k.name].append(k.home[e])
++                    k.home[e] = None
++        else:
++            ids = order[S_new:S]
++            n = int(ids.numel())
++            taken = {}
++            try:  # acquire-then-commit: nothing is touched until every kind has its slots
++                for k in st.kinds.values():
++                    taken[k.name] = self._take_slots(k.name, n, k.tail, k.dtype)
++            except Exception:
++                for name, slots in taken.items():
++                    self.pool[name].extend(slots)
++                raise
++            for k in st.kinds.values():
++                view = k.arena.view(S, k.tail, k.dtype)
++                slots = taken[k.name]
++                addrs = torch.empty(n, dtype=torch.int64)
++                for i, e in enumerate(ids.tolist()):
++                    dst, r = slots[i]
++                    dst[r].copy_(view[S_new + i], non_blocking=True)
++                    k.home[e] = slots[i]
++                    addrs[i] = self._slot_addr(slots[i], k.rb)
++                torch.cuda.synchronize()
++                k.tab[ids.to(self.device)] = addrs.to(self.device)
++            torch.cuda.synchronize()
++            for k in st.kinds.values():
++                k.arena.shrink_rows(S_new)
++        for k in st.kinds.values():
++            view = k.arena.view(S_new, k.tail, k.dtype)
++            getattr(st.layer, k.name).data = view
++            st.layer._placed["proto"][k.name] = view
++        st.layer._placed["S"] = S_new
++        st.S = S_new
++        torch.cuda.synchronize()
++
++    def s_floor(self):
++        """Smallest uniform S the host side can absorb: pool slots first, then the pinned
++        fallback budget (shared across kinds)."""
++        if not self.layers:
++            return 0
++        L = len(self.layers)
++        cur = sum(st.S for st in self.layers.values())
++        avail = 0 if self._serving else self.pin_budget - self.pin_used
++        rb = {
++            n: next(
++                k.rb
++                for st in self.layers.values()
++                for k in st.kinds.values()
++                if k.name == n
++            )
++            for n in NAMES
++            if any(n in st.kinds for st in self.layers.values())
++        }
++        best = -(-cur // L)  # ceil(mean S): always feasible
++        for S_ in range(best, -1, -1):
++            D = cur - L * S_  # rows per kind that must move to the host
++            cost = sum(max(0, D - len(self.pool[n])) * rb[n] for n in rb)
++            if cost > avail:
++                break
++            best = S_
++        return best
++
++    def set_S(self, S):
++        S = max(self.s_floor(), min(int(S), self.E))
++        t0 = time.time()
++        torch.cuda.empty_cache()  # cuMemCreate needs driver-free memory, not torch-cached
++        for lid in sorted(self.layers):
++            self.resize_layer(lid, S)
++        logger.info(
++            "elastic: S=%d for all layers in %.2fs, VRAM free %.2f GB",
++            S,
++            time.time() - t0,
++            torch.cuda.mem_get_info()[0] / 2**30,
++        )
++
++    def fill(self, reserve_mb, step=8):
++        """Grow all layers uniformly while more than reserve_mb stays free."""
++        reserve = int(reserve_mb) << 20
++        torch.cuda.empty_cache()
++        while True:
++            cur = min(st.S for st in self.layers.values())
++            if cur >= self.E:
++                break
++            need = sum(
++                k.arena.bytes_to_reach(min(self.E, st.S + step))
++                for st in self.layers.values()
++                for k in st.kinds.values()
++            )
++            if torch.cuda.mem_get_info()[0] - need < reserve:
++                break
++            try:
++                for lid in sorted(self.layers):
++                    self.resize_layer(lid, min(self.E, self.layers[lid].S + step))
++            except ArenaOOM:
++                break
++        logger.info(
++            "elastic fill: S=%s, VRAM free %.2f GB",
++            sorted({st.S for st in self.layers.values()}),
++            torch.cuda.mem_get_info()[0] / 2**30,
++        )
++
++    def free(self, want_mb, step=8):
++        """Shrink all layers uniformly until at least want_mb of VRAM is free."""
++        want = int(want_mb) << 20
++        while torch.cuda.mem_get_info()[0] < want:
++            cur = max(st.S for st in self.layers.values())
++            target = max(self.s_floor(), cur - step)
++            if target >= cur:
++                break
++            try:
++                for lid in sorted(self.layers):
++                    if self.layers[lid].S > target:
++                        self.resize_layer(lid, target)
++            except (
++                ArenaOOM,
++                RuntimeError,
++            ) as ex:  # partial shrink is still a shrink; report and stop
++                logger.warning("elastic free stopped: %s", ex)
++                break
++        self.pending_regrow = True
++        logger.info(
++            "elastic free: S=%s, VRAM free %.2f GB",
++            sorted({st.S for st in self.layers.values()}),
++            torch.cuda.mem_get_info()[0] / 2**30,
++        )
++
++    def regrow(self):
++        """Grow back into free VRAM after a forced shrink (called at a safe point: KV pool idle)."""
++        self.pending_regrow = False
++        self.fill(self.regrow_reserve)
++        self.write_status()
++
++    # ------------------------------------------------------------------ control
++    def write_status(self):
++        if not self.ctl:
++            return
++        free, total = torch.cuda.mem_get_info()
++        arena = sum(
++            k.arena.backed_bytes
++            for st in self.layers.values()
++            for k in st.kinds.values()
++        )
++        S = [self.layers[l].S for l in sorted(self.layers)]
++        covered = sum(
++            float(self.mass[l][self.order[l][: self.layers[l].S]].sum())
++            for l in self.layers
++        ) / float(self.mass.sum())
++        with open(self.ctl + ".status", "w") as f:
++            f.write(
++                f"time {time.strftime('%H:%M:%S')}\nS_min {min(S)} S_max {max(S)} floor {self.s_floor()}\n"
++                f"arena_GB {arena / 2**30:.3f}\nvram_free_GB {free / 2**30:.3f}\nmass_covered {covered:.4f}\n"
++                f"pool {[len(self.pool[n]) for n in NAMES]} pin_used_MB {self.pin_used >> 20}\nS {S}\n"
++            )
++
++    def poll(self, m: int = 0, lid: int = 0):
++        """Called from the MoE apply path. Acts only at layer 0 of a small eager forward (m <= 16
++        rows, i.e. a 1-token prefill or eager decode): a resize inside a real prefill would strip
++        that forward's working memory."""
++        self._calls += 1
++        if torch.cuda.is_current_stream_capturing() or lid != 0 or m > 16:
++            return
++        if (
++            self._autofill is not None and self._calls > 48 * 4
++        ):  # after warmup: grow into free VRAM
++            reserve, self._autofill = self._autofill, None
++            try:
++                self.fill(reserve)
++            except Exception as ex:
++                logger.exception("elastic autofill failed: %s", ex)
++            self.write_status()
++        if not self.ctl:
++            return
++        try:
++            m = os.stat(self.ctl).st_mtime
++        except FileNotFoundError:
++            return
++        if m <= self._ctl_mtime:
++            return
++        self._ctl_mtime = m
++        try:
++            cmd = open(self.ctl).read().split()
++            if not cmd:
++                return
++            t0 = time.time()
++            if cmd[0] == "S":
++                self.set_S(int(cmd[1]))
++            elif cmd[0] == "fill":
++                self.fill(int(cmd[1]) if len(cmd) > 1 else 512)
++            elif cmd[0] == "free":
++                self.free(int(cmd[1]))
++            logger.info(
++                "elastic ctl '%s' done in %.2fs", " ".join(cmd), time.time() - t0
++            )
++        except Exception as ex:  # never take the server down over a control command
++            logger.exception("elastic ctl failed: %s", ex)
++        self.write_status()
+diff --git a/python/sglang/srt/layers/moe/row_arena.py b/python/sglang/srt/layers/moe/row_arena.py
+new file mode 100644
+index 0000000000..a29f8cb461
+--- /dev/null
++++ b/python/sglang/srt/layers/moe/row_arena.py
+@@ -0,0 +1,173 @@
++"""RowArena: a GPU cache of fixed-size rows whose physical memory can be handed back.
++
++The arena reserves virtual address space for ``max_rows`` rows once (cuMemAddressReserve) and
++backs a PREFIX of it with physical chunks on demand (cuMemCreate + cuMemMap). Rows are kept in
++rank order (hottest first), so shrinking the cache is a tail unmap: the memory really returns to
++the driver, in chunks, while every row address stays constant for the arena's lifetime. Kernels
++that read rows through an address table, and CUDA graphs that captured such kernels, never need
++to know.
++
++    a = RowArena(row_bytes, max_rows, device_id)
++    a.ensure_rows(n)      rows [0, n) are physically backed (may raise ArenaOOM)
++    a.shrink_rows(n)      release every chunk that lies entirely beyond row n
++    a.row_addr(i)         base + i * row_bytes (valid as an address even when unbacked)
++    a.view(n, tail, dtype) non-owning torch tensor [n, *tail] over the backed prefix
++    a.backed_rows         rows guaranteed backed right now
++
++Chunk size is a multiple of the device granularity (2 MiB on current GPUs); with 4 MiB chunks
++the cache is resizable in ~20-row steps for a 205 KB expert row.
++
++Unit test: test/registered/unit/layers/moe/test_row_arena.py.
++"""
++
++import torch
++
++from sglang.srt.cuda_vmm_utils import (  # the driver plumbing SGLang already ships
++    _get_cuda_driver,
++    align_up,
++    check_drv,
++    get_device_granularity,
++    make_device_allocation_prop,
++    make_rw_access_desc,
++    tensor_from_pointer,
++)
++
++
++class ArenaOOM(RuntimeError):
++    """cuMemCreate failed: the device has no free physical memory for another chunk."""
++
++
++class RowArena:
++    def __init__(
++        self,
++        row_bytes: int,
++        max_rows: int,
++        device_id: int = 0,
++        chunk_bytes: int = 4 << 20,
++        name: str = "",
++    ):
++        drv = _get_cuda_driver()
++        self.row_bytes, self.max_rows, self.device_id, self.name = (
++            int(row_bytes),
++            int(max_rows),
++            int(device_id),
++            name,
++        )
++        self.gran = get_device_granularity(self.device_id)
++        self.chunk = align_up(chunk_bytes, self.gran)
++        self.prop = make_device_allocation_prop(self.device_id, handle_types=None)
++        self.access = [make_rw_access_desc(self.device_id)]
++        self.va_bytes = align_up(self.row_bytes * self.max_rows, self.chunk)
++        self.base = int(
++            check_drv(
++                drv.cuMemAddressReserve(self.va_bytes, 0, 0, 0), "cuMemAddressReserve"
++            )
++        )
++        self._handles = []  # chunk i backs [i*chunk, (i+1)*chunk)
++        self._closed = False
++
++    # ---------------------------------------------------------------- geometry
++    @property
++    def backed_bytes(self) -> int:
++        return len(self._handles) * self.chunk
++
++    @property
++    def backed_rows(self) -> int:
++        return min(self.max_rows, self.backed_bytes // self.row_bytes)
++
++    def row_addr(self, i: int) -> int:
++        return self.base + i * self.row_bytes
++
++    def chunks_for_rows(self, n: int) -> int:
++        return (
++            -(-(min(int(n), self.max_rows) * self.row_bytes) // self.chunk)
++            if n > 0
++            else 0
++        )
++
++    def bytes_to_reach(self, n: int) -> int:
++        """Bytes cuMemCreate would need to make rows [0, n) backed (chunk-granular)."""
++        return max(0, self.chunks_for_rows(n) - len(self._handles)) * self.chunk
++
++    def rows_for_bytes(self, nbytes: int) -> int:
++        return min(self.max_rows, int(nbytes) // self.row_bytes)
++
++    # ---------------------------------------------------------------- resize
++    def ensure_rows(self, n: int) -> int:
++        """Back rows [0, n). Returns the number of bytes newly mapped."""
++        n = max(0, min(int(n), self.max_rows))
++        want_chunks = -(-(n * self.row_bytes) // self.chunk) if n else 0
++        drv = _get_cuda_driver()
++        added = 0
++        with torch.cuda.device(self.device_id):
++            while len(self._handles) < want_chunks:
++                off = len(self._handles) * self.chunk
++                err, handle = drv.cuMemCreate(self.chunk, self.prop, 0)
++                if err != drv.CUresult.CUDA_SUCCESS:
++                    raise ArenaOOM(
++                        f"{self.name}: cuMemCreate({self.chunk >> 20} MiB) -> {err}"
++                    )
++                try:
++                    check_drv(
++                        drv.cuMemMap(self.base + off, self.chunk, 0, handle, 0),
++                        "cuMemMap",
++                    )
++                    check_drv(
++                        drv.cuMemSetAccess(self.base + off, self.chunk, self.access, 1),
++                        "cuMemSetAccess",
++                    )
++                except BaseException:
++                    drv.cuMemRelease(handle)
++                    raise
++                self._handles.append(handle)
++                added += self.chunk
++        return added
++
++    def shrink_rows(self, n: int) -> int:
++        """Keep rows [0, n) backed, release every chunk entirely beyond. Returns bytes freed.
++        The caller must make sure no kernel still reads the released rows (sync first).
++        """
++        n = max(0, min(int(n), self.max_rows))
++        keep_chunks = -(-(n * self.row_bytes) // self.chunk) if n else 0
++        drv = _get_cuda_driver()
++        freed = 0
++        while len(self._handles) > keep_chunks:
++            off = (len(self._handles) - 1) * self.chunk
++            handle = self._handles.pop()
++            check_drv(drv.cuMemUnmap(self.base + off, self.chunk), "cuMemUnmap")
++            check_drv(drv.cuMemRelease(handle), "cuMemRelease")
++            freed += self.chunk
++        return freed
++
++    # ---------------------------------------------------------------- views
++    def view(
++        self, n_rows: int, tail=(), dtype: torch.dtype = torch.uint8
++    ) -> torch.Tensor:
++        """Non-owning tensor [n_rows, *tail] over the backed prefix. Re-create after a shrink."""
++        assert (
++            n_rows <= self.backed_rows
++        ), f"{self.name}: view of {n_rows} rows, only {self.backed_rows} backed"
++        return tensor_from_pointer(
++            self.base,
++            n_rows * self.row_bytes,
++            shape=(n_rows,) + tuple(tail),
++            dtype=dtype,
++            device_id=self.device_id,
++        )
++
++    def close(self):
++        if self._closed:
++            return
++        self._closed = True
++        torch.cuda.synchronize()
++        self.shrink_rows(0)
++        check_drv(
++            _get_cuda_driver().cuMemAddressFree(self.base, self.va_bytes),
++            "cuMemAddressFree",
++        )
++
++    def __del__(self):
++        try:
++            self.close()
++        except Exception:
++            pass
+diff --git a/python/sglang/srt/mem_cache/allocator/paged.py b/python/sglang/srt/mem_cache/allocator/paged.py
+index b092911f29..39133cf150 100755
+--- a/python/sglang/srt/mem_cache/allocator/paged.py
++++ b/python/sglang/srt/mem_cache/allocator/paged.py
+@@ -146,6 +146,31 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+                 pass
+         self.clear()
+ 
++    def _lazy_hook(self, pages: torch.Tensor) -> bool:
++        """Back the KV rows of the pages about to be handed out. False = no physical memory."""
++        kv = getattr(self._kvcache, "full_kv_pool", self._kvcache)
++        ensure = getattr(kv, "lazy_ensure", None)
++        if ensure is None or pages.numel() == 0:
++            return True
++        try:
++            ensure((int(pages.max().item()) + 1) * self.page_size)
++            return True
++        except Exception as ex:
++            __import__("logging").getLogger(__name__).warning(
++                "KV lazy backing: commit failed, allocation refused (%s)", ex
++            )
++            return False
++
++    def _lazy_idle_check(self) -> None:
++        if (
++            len(self.free_pages) + len(self.release_pages) >= self.num_pages
++        ):  # pool idle: slot order + give memory back
++            kv = getattr(self._kvcache, "full_kv_pool", self._kvcache)
++            release = getattr(kv, "lazy_release", None)
++            if release is not None:
++                self.clear()
++                release()
++
+     def alloc(self, need_size: int):
+         # page-aligned allocation, returning contiguous indices of pages
+         if self.debug_mode:
+@@ -160,6 +185,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+             return None
+ 
+         out_pages = self.free_pages[:num_pages]
++        if not self._lazy_hook(out_pages):
++            return None
+         self.free_pages = self.free_pages[num_pages:]
+ 
+         out_indices = (
+@@ -215,6 +242,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+             )
+         if num_new_pages > len(self.free_pages):
+             return None
++        if not self._lazy_hook(self.free_pages[:num_new_pages]):
++            return None
+ 
+         self.free_pages = self.free_pages[num_new_pages:]
+         return out_indices
+@@ -254,6 +283,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+         )
+         if num_new_pages > len(self.free_pages):
+             return None
++        if not self._lazy_hook(self.free_pages[:num_new_pages]):
++            return None
+ 
+         self.free_pages = self.free_pages[num_new_pages:]
+         return out_indices
+@@ -312,6 +343,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+             self.release_pages = torch.cat((*page_ids, self.release_pages))
+         else:
+             self.free_pages = torch.cat((*page_ids, self.free_pages))
++        self._lazy_idle_check()
+ 
+     def free_group_begin(self):
+         super().free_group_begin()
+diff --git a/python/sglang/srt/mem_cache/allocator/token.py b/python/sglang/srt/mem_cache/allocator/token.py
+index 06aceef120..1c081629f8 100644
+--- a/python/sglang/srt/mem_cache/allocator/token.py
++++ b/python/sglang/srt/mem_cache/allocator/token.py
+@@ -61,6 +61,19 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+ 
+         select_index = self.free_pages[:need_size]
+         self.free_pages = self.free_pages[need_size:]
++        kv = getattr(self._kvcache, "full_kv_pool", self._kvcache)
++        ensure = getattr(kv, "lazy_ensure", None)
++        if ensure is not None:
++            try:
++                ensure(int(select_index.max().item()) + 1)
++            except (
++                Exception
++            ) as ex:  # no physical memory: hand the slots back, report "full"
++                self.free_pages = torch.cat((select_index, self.free_pages))
++                __import__("logging").getLogger(__name__).warning(
++                    "KV lazy backing: commit failed, allocation refused (%s)", ex
++                )
++                return None
+         return select_index
+ 
+     def free(self, free_index: torch.Tensor):
+@@ -72,6 +85,14 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+                 self.release_pages = torch.cat((self.release_pages, free_index))
+             else:
+                 self.free_pages = torch.cat((self.free_pages, free_index))
++            if (
++                self.available_size() >= self.size
++            ):  # pool idle: slot order + give memory back
++                kv = getattr(self._kvcache, "full_kv_pool", self._kvcache)
++                release = getattr(kv, "lazy_release", None)
++                if release is not None:
++                    self.clear()
++                    release()
+         else:
+             self.free_group.append(self._copy_for_free_group(free_index))
+ 
+diff --git a/python/sglang/srt/mem_cache/kv_cache_configurator.py b/python/sglang/srt/mem_cache/kv_cache_configurator.py
+index 7057d31c5c..b4bee9de4a 100644
+--- a/python/sglang/srt/mem_cache/kv_cache_configurator.py
++++ b/python/sglang/srt/mem_cache/kv_cache_configurator.py
+@@ -1900,6 +1900,24 @@ class KVCacheConfigurator:
+         If constraints change the value, the configurator re-runs and re-aligns.
+         """
+         user_limit = get_schedule().max_total_tokens
++        _env = __import__("os").environ
++        _lazy_tokens = (
++            int(_env.get("SGLANG_KV_LAZY_TOKENS", "0"))
++            if _env.get("SGLANG_KV_LAZY") == "1"
++            else 0
++        )
++        if _lazy_tokens > 0:
++            # The profiled capacity is what the free VRAM at startup could back physically; with the
++            # headroom rule (1.5 GB kept free for prefill working memory) the practical limit measured
++            # 0.85 x profiled (84k of 106k tokens at bf16). Longer prompts are rejected at admission
++            # instead of crashing the scheduler mid-prefill.
++            _safety = float(_env.get("SGLANG_KV_LAZY_SAFETY", "0.85"))
++            _new = min(_lazy_tokens, int(token_capacity * _safety))
++            logging.warning(
++                f"KV lazy backing: token capacity {token_capacity} (profiled) -> {_new} "
++                f"(requested {_lazy_tokens}, safety {_safety})"
++            )
++            token_capacity = _new
+ 
+         # Apply user-specified upper bound
+         if user_limit is not None:
+diff --git a/python/sglang/srt/mem_cache/kv_vmm_backing.py b/python/sglang/srt/mem_cache/kv_vmm_backing.py
+index c720cc69ac..4abfae9ac1 100644
+--- a/python/sglang/srt/mem_cache/kv_vmm_backing.py
++++ b/python/sglang/srt/mem_cache/kv_vmm_backing.py
+@@ -187,6 +187,38 @@ class KvVmmArena:
+         """Total physically-backed bytes (sum of scattered per-buffer ranges)."""
+         return self._range_backed
+ 
++    def uncommit_beyond(self, offset: int, keep_bytes: int) -> int:
++        """Release every mapping of the buffer at ``offset`` that starts at or beyond
++        ``keep_bytes`` (mappings straddling the boundary stay). Returns bytes freed."""
++        if self._closed:
++            return 0
++        from sglang.srt.cuda_vmm_utils import _get_cuda_driver, check_drv
++
++        drv = _get_cuda_driver()
++        start = self.base + offset
++        limit = start + self._committed_by_offset.get(offset, 0)
++        cut = start + self._align(int(keep_bytes))
++        maps = self._allocation._mappings
++        victims = sorted(
++            [m for m in maps if start <= m[0] < limit and m[0] >= cut],
++            key=lambda m: -m[0],
++        )
++        freed = 0
++        with torch.cuda.device(self.device_id):
++            for m in victims:
++                address, size, handle = m
++                check_drv(drv.cuMemUnmap(address, size), "cuMemUnmap(uncommit)")
++                if handle is not None:
++                    check_drv(drv.cuMemRelease(handle), "cuMemRelease(uncommit)")
++                maps.remove(m)
++                freed += size
++        if freed:
++            self._committed_by_offset[offset] = (
++                self._committed_by_offset.get(offset, 0) - freed
++            )
++            self._range_backed -= freed
++        return freed
++
+     @property
+     def cursor_bytes(self) -> int:
+         return int(self._fn_cursor())
+@@ -336,6 +368,28 @@ class KvVmmBufferOwner:
+         self._back_spans(
+             [s.desc.prefix_span_bytes(num_tokens, self.page_size) for s in self._specs]
+         )
++        self.backed_tokens = max(getattr(self, "backed_tokens", 0), int(num_tokens))
++
++    def release_beyond(self, num_tokens: int) -> int:
++        """Unmap the backing beyond the first ``num_tokens`` slots of every buffer."""
++        if self._arena is None:
++            return 0
++        torch.cuda.synchronize()
++        freed = 0
++        for s in self._specs:
++            keep = align_up(
++                s.desc.prefix_span_bytes(num_tokens, self.page_size),
++                self._arena.granularity,
++            )
++            freed += self._arena.uncommit_beyond(s.offset, keep)
++            s.backed_to = min(
++                s.backed_to, self._arena._committed_by_offset.get(s.offset, 0)
++            )
++        self.backed_tokens = min(getattr(self, "backed_tokens", 0), int(num_tokens))
++        return freed
++
++    def bytes_per_token(self) -> int:
++        return sum(-(-s.desc.row_bytes // s.desc.tokens_per_row) for s in self._specs)
+ 
+     def finalize(self, final_num_tokens: int) -> None:
+         """Back each buffer's final advertised span; set the final serving capacity."""
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+index 7d8b27ede2..0f3b9ffa4c 100644
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -2056,6 +2056,20 @@ class MHATokenToKVPool(KVCache):
+             self.dq_v_buffer = None
+             if self.post_capture_active:
+                 self._alloc_post_capture_buffers()
++            elif os.environ.get("SGLANG_KV_LAZY") == "1":
++                self._alloc_post_capture_buffers()
++                self._lazy_floor = min(
++                    self.size, int(os.environ.get("SGLANG_KV_LAZY_FLOOR", "4096"))
++                )
++                self._lazy_margin = int(os.environ.get("SGLANG_KV_LAZY_MARGIN", "2048"))
++                self._post_capture_owner.ensure_prefix(self._lazy_floor)
++                logger.info(
++                    "KV lazy backing: %d tokens reserved as VA, %d backed (floor), margin %d, %.1f KB/token",
++                    self.size,
++                    self._lazy_floor,
++                    self._lazy_margin,
++                    self._post_capture_owner.bytes_per_token() / 1024,
++                )
+             else:
+                 self._create_buffers_normal()
+         self._kv_buffer_descs = self._build_kv_buffer_descs()
+@@ -2262,6 +2276,97 @@ class MHATokenToKVPool(KVCache):
+         self.k_buffer = tensors[: self.layer_num]
+         self.v_buffer = tensors[self.layer_num :]
+ 
++    def lazy_ensure(self, num_tokens: int) -> None:
++        """Back KV slots [0, num_tokens + margin). A failed commit first shrinks the elastic
++        expert cache, then retries once."""
++        o = getattr(self, "_post_capture_owner", None)
++        if o is None or not hasattr(self, "_lazy_floor"):
++            return
++        m = self._lazy_margin  # commit in margin-sized steps
++        want = min(
++            self.size + self.page_size, -(-(int(num_tokens) + m) // m) * m
++        )  # slot index == size exists
++        if want <= o.backed_tokens:
++            return
++        # watermark: after the commit at least SGLANG_KV_LAZY_HEADROOM_MB must stay driver-free for
++        # the prefill's working memory; otherwise the elastic expert cache gives way first.
++        headroom = int(os.environ.get("SGLANG_KV_LAZY_HEADROOM_MB", "1536")) << 20
++        delta = (want - o.backed_tokens) * o.bytes_per_token()
++        if torch.cuda.mem_get_info()[0] - delta < headroom:
++            from sglang.srt.layers.moe.expert_elastic import ExpertElastic
++
++            el = ExpertElastic.inst
++            # Below the watermark for the whole tail of a long prefill, empty_cache() on every 2048-token
++            # commit forces torch to cudaMalloc its working set again each time (periodic ~1 s spikes).
++            # Only do the expensive part when the expert cache still has rows to give back, else rate-limit.
++            can_shrink = el is not None and any(
++                st.S > el.s_floor() for st in el.layers.values()
++            )
++            now = __import__("time").time()
++            last = getattr(self, "_lazy_last_empty", 0.0)
++            if can_shrink or now - last > 30.0:
++                torch.cuda.empty_cache()
++                self._lazy_last_empty = now
++                if can_shrink and torch.cuda.mem_get_info()[0] - delta < headroom:
++                    el.free(((headroom + delta) >> 20) + 64)
++                if torch.cuda.mem_get_info()[0] - delta < headroom // 2:
++                    raise RuntimeError(
++                        f"KV lazy backing: no headroom for {want} tokens "
++                        f"(free {torch.cuda.mem_get_info()[0] >> 20} MB, need {(delta + headroom) >> 20} MB)"
++                    )
++        try:
++            try:
++                o.ensure_prefix(want)
++            except Exception:
++                torch.cuda.empty_cache()  # torch-cached blocks are not driver-free
++                o.ensure_prefix(want)
++            _free = torch.cuda.mem_get_info()[0]
++            logger.info(
++                "KV lazy commit: tokens %d -> %d (owner backed %.0f MB, torch reserved %.2f GB, driver free %.2f GB, capturing=%s)",
++                num_tokens,
++                want,
++                o.backed_bytes / 2**20,
++                torch.cuda.memory_reserved() / 2**30,
++                _free / 2**30,
++                torch.cuda.is_current_stream_capturing(),
++            )
++        except Exception as ex:
++            from sglang.srt.layers.moe.expert_elastic import ExpertElastic
++
++            el = ExpertElastic.inst
++            if el is None:
++                raise
++            need_mb = (
++                (want - o.backed_tokens) * o.bytes_per_token() >> 20
++            ) + 1024  # + prefill working memory
++            logger.warning(
++                "KV lazy commit failed (%s); shrinking expert cache to free %d MB",
++                ex,
++                need_mb,
++            )
++            el.free(need_mb)
++            o.ensure_prefix(want)
++
++    def lazy_release(self) -> None:
++        o = getattr(self, "_post_capture_owner", None)
++        if o is None or not hasattr(self, "_lazy_floor"):
++            return
++        freed = o.release_beyond(self._lazy_floor)
++        if freed:
++            logger.info(
++                "KV lazy backing: released %.0f MB beyond the %d-token floor",
++                freed / 2**20,
++                self._lazy_floor,
++            )
++        try:  # pool idle = no forward in flight: safe point to regrow experts
++            from sglang.srt.layers.moe.expert_elastic import ExpertElastic
++
++            el = ExpertElastic.inst
++            if el is not None and el.pending_regrow:
++                el.regrow()
++        except Exception as ex:
++            logger.warning("elastic regrow after KV release failed: %s", ex)
++
+     def _alloc_post_capture_buffers(self):
+         dev = torch.device(self.device)
+         device_id = dev.index if dev.index is not None else torch.cuda.current_device()
+diff --git a/test/registered/unit/layers/moe/test_row_arena.py b/test/registered/unit/layers/moe/test_row_arena.py
+new file mode 100644
+index 0000000000..7938cee00f
+--- /dev/null
++++ b/test/registered/unit/layers/moe/test_row_arena.py
+@@ -0,0 +1,178 @@
++"""Unit tests for ``RowArena`` (``layers/moe/row_arena.py``): a VMM-backed cache
++of fixed-size rows whose physical memory can be handed back to the driver while
++every row address stays constant.
++
++Needs a CUDA device with ~150 MB free: a 100 MiB virtual reservation of which
++36 MiB are backed, one pinned host row (200 KB) that stands in for the "cold"
++rows, and a Triton gather kernel that reads rows through an address table.
++  1. geometry: chunk / VA alignment, ``chunks_for_rows`` / ``bytes_to_reach`` /
++     ``rows_for_bytes`` before and after backing;
++  2. ``ensure_rows`` backs a prefix (driver-free memory drops by exactly the
++     mapped bytes); a table gather through GPU and host addresses reads every
++     row; a CUDA graph captured against the arena addresses replays after a
++     ``shrink_rows`` (memory returns, evicted rows repointed to the host row)
++     and after growing back (survivor rows intact); ``close`` returns the
++     memory;
++  3. ``ArenaOOM`` is raised when a chunk cannot be created (chunk larger than
++     the device).
++"""
++
++import unittest
++
++import torch
++
++from sglang.srt.layers.moe.row_arena import ArenaOOM, RowArena
++from sglang.test.ci.ci_register import register_cuda_ci
++from sglang.test.test_utils import CustomTestCase
++
++register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
++
++ROW_BYTES, E, S = 204800, 512, 184  # a w13 int2 expert row; 184 resident of 512
++SLACK = 8 << 20  # allocator noise allowed on the driver-free deltas
++
++
++def _gather_kernel():
++    import triton
++    import triton.language as tl
++
++    @triton.jit
++    def _gather(tab_ptr, idx_ptr, out_ptr, row_bytes, BLOCK: tl.constexpr):
++        r = tl.program_id(0)
++        e = tl.load(idx_ptr + r)
++        src = tl.load(tab_ptr + e).to(tl.pointer_type(tl.uint8))
++        for off in range(0, row_bytes, BLOCK):
++            o = off + tl.arange(0, BLOCK)
++            m = o < row_bytes
++            tl.store(
++                out_ptr + r * row_bytes + o, tl.load(src + o, mask=m, other=0), mask=m
++            )
++
++    return _gather
++
++
++@unittest.skipUnless(torch.cuda.is_available(), "RowArena needs the CUDA driver API")
++class TestRowArena(CustomTestCase):
++    def test_geometry(self):
++        a = RowArena(ROW_BYTES, E, 0, name="geom")
++        try:
++            self.assertEqual(a.chunk % a.gran, 0)
++            self.assertGreaterEqual(a.chunk, 4 << 20)
++            self.assertEqual(a.va_bytes % a.chunk, 0)
++            self.assertGreaterEqual(a.va_bytes, ROW_BYTES * E)
++            self.assertEqual(a.backed_rows, 0)
++            self.assertEqual(a.chunks_for_rows(0), 0)
++            self.assertEqual(a.chunks_for_rows(1), 1)
++            self.assertEqual(a.chunks_for_rows(E), -(-(E * ROW_BYTES) // a.chunk))
++            self.assertEqual(a.chunks_for_rows(E + 100), a.chunks_for_rows(E))
++            self.assertEqual(a.bytes_to_reach(S), a.chunks_for_rows(S) * a.chunk)
++            self.assertEqual(a.rows_for_bytes(a.chunk), min(E, a.chunk // ROW_BYTES))
++            self.assertEqual(a.row_addr(7), a.base + 7 * ROW_BYTES)
++            added = a.ensure_rows(S)
++            self.assertEqual(added, a.chunks_for_rows(S) * a.chunk)
++            self.assertGreaterEqual(a.backed_rows, S)
++            self.assertEqual(a.bytes_to_reach(S), 0)
++            self.assertEqual(a.ensure_rows(S), 0)  # idempotent
++            self.assertEqual(
++                a.bytes_to_reach(E),
++                (a.chunks_for_rows(E) - a.chunks_for_rows(S)) * a.chunk,
++            )
++            with self.assertRaises(AssertionError):
++                a.view(a.backed_rows + 1, (ROW_BYTES,))
++        finally:
++            a.close()
++
++    def test_ensure_shrink_grow_with_graph_replay(self):
++        gather = _gather_kernel()
++        free0 = torch.cuda.mem_get_info()[0]
++        a = RowArena(ROW_BYTES, E, 0, name="w13")
++        try:
++            added = a.ensure_rows(S)
++            free1 = torch.cuda.mem_get_info()[0]
++            self.assertGreaterEqual(a.backed_rows, S)
++            self.assertLess(abs((free0 - free1) - added), SLACK)
++
++            v = a.view(S, (ROW_BYTES,))
++            for i in range(S):
++                v[i].fill_(i % 251)
++            # one "cold" row on the host stands in for every evicted expert
++            host = torch.full((1, ROW_BYTES), 7, dtype=torch.uint8).pin_memory()
++            tab = torch.empty(E, dtype=torch.int64)
++            for e in range(E):
++                tab[e] = a.row_addr(e) if e < S else host.data_ptr()
++            tab = tab.cuda()
++            idx = torch.tensor([0, 5, 183, 184, 511, 63, 64], dtype=torch.int64).cuda()
++            out = torch.empty(len(idx), ROW_BYTES, dtype=torch.uint8, device="cuda")
++
++            def run():
++                gather[(len(idx),)](tab, idx, out, ROW_BYTES, BLOCK=4096)
++
++            run()
++            torch.cuda.synchronize()
++            exp = [i % 251 if i < S else 7 for i in idx.tolist()]
++            self.assertEqual(out[:, 0].tolist(), exp)
++            self.assertEqual(out[:, -1].tolist(), exp)
++
++            # CUDA graph captured against the arena addresses
++            g = torch.cuda.CUDAGraph()
++            s = torch.cuda.Stream()
++            with torch.cuda.stream(s):
++                run()
++            torch.cuda.synchronize()
++            with torch.cuda.graph(g, stream=s):
++                run()
++            torch.cuda.synchronize()
++
++            # shrink to 64 rows: memory returns, addresses stay
++            free_a = torch.cuda.mem_get_info()[0]
++            freed = a.shrink_rows(64)
++            free_b = torch.cuda.mem_get_info()[0]
++            self.assertGreater(freed, 0)
++            self.assertGreaterEqual(a.backed_rows, 64)
++            self.assertLess(a.backed_rows, S)
++            self.assertLess(abs((free_b - free_a) - freed), SLACK)
++            # repoint evicted rows to the host, replay the graph
++            tab_cpu = tab.cpu()
++            for e in range(64, S):
++                tab_cpu[e] = host.data_ptr()
++            tab.copy_(tab_cpu)
++            g.replay()
++            torch.cuda.synchronize()
++            exp2 = [i % 251 if i < 64 else 7 for i in idx.tolist()]
++            self.assertEqual(out[:, 0].tolist(), exp2)
++
++            # grow back, refill, replay: survivors intact
++            a.ensure_rows(S)
++            v = a.view(S, (ROW_BYTES,))
++            for i in range(64, S):
++                v[i].fill_(i % 251)
++            for e in range(64, S):
++                tab_cpu[e] = a.row_addr(e)
++            tab.copy_(tab_cpu)
++            g.replay()
++            torch.cuda.synchronize()
++            self.assertEqual(out[:, 0].tolist(), exp)
++            self.assertEqual(v[:64, 0].tolist(), [i % 251 for i in range(64)])
++            del g
++            # close returns every backed chunk to the driver
++            torch.cuda.synchronize()
++            backed = a.backed_bytes
++            free_c = torch.cuda.mem_get_info()[0]
++        finally:
++            a.close()
++        self.assertEqual(a.backed_rows, 0)
++        self.assertLess(abs((torch.cuda.mem_get_info()[0] - free_c) - backed), SLACK)
++
++    def test_oom_raises_arena_oom(self):
++        total = torch.cuda.mem_get_info()[1]
++        # a single chunk larger than the whole device: cuMemCreate must fail
++        big = RowArena(1 << 20, 4, 0, chunk_bytes=total + (1 << 30), name="oom-probe")
++        try:
++            with self.assertRaises(ArenaOOM):
++                big.ensure_rows(1)
++            self.assertEqual(big.backed_rows, 0)
++        finally:
++            big.close()
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.43.0
+

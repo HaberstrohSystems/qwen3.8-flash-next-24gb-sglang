@@ -1,9 +1,12 @@
 # SGLang serving patch for Qwen3.8-Flash-Next at 2.572 bpw -- patch notes
 
-File: `qwen4exp-serving-73a255206f.patch` (this directory). Written 2026-09-03.
-Every number below names its source (file and line). Paths are relative to the root of this
-repository: `CAMPAIGN.md` means `docs/CAMPAIGN.md` (the dated, append-only engineering log; `:N` is
-line N), `state` means `assets/phase1_state.json`, `WRITEUP.md` means `docs/WRITEUP.md`.
+File: `qwen4exp-serving-73a255206f.patch` (this directory), the verbatim diff of the tree that
+served the published numbers. The reviewable form of the same change is the five-commit series
+under `upstream/` (`UPSTREAM.md`); these notes describe the flat patch, which remains the
+reproduction artifact. Written 2026-09-03. Every number below names its source (file and line).
+Paths are relative to the root of this repository: `CAMPAIGN.md` means `docs/CAMPAIGN.md` (the
+dated, append-only engineering log; `:N` is line N), `state` means `assets/phase1_state.json`,
+`WRITEUP.md` means `docs/WRITEUP.md`.
 
 ## 1. What the patch is
 
@@ -12,15 +15,15 @@ checkout on 2026-09-03, at restart #23) and its base commit:
 
 | | |
 |---|---|
-| Base commit | `73a255206f916366c8d26d4022f82ddfb0ab558d` "Introduce Qwen 3.8 Flash Next" (Qiaolin-Yu, 2026-08-26 01:36:27 -0700) |
-| Remote | `https://github.com/sgl-project/sglang.git` (`git remote -v`); the local clone is shallow (1 commit, blob-less) on a local branch `w2a16-moe`, so whether the commit sits on `main` or on a PR ref is not recorded here. `WRITEUP.md:154` says Flash-Next support "lives in an open PR". |
+| Base commit | `73a255206f916366c8d26d4022f82ddfb0ab558d` "Introduce Qwen 3.8 Flash Next" (Qiaolin-Yu, 2026-08-26 01:36:27 -0700); the first commit of the branch `qwen4-main-squashed` of the open PR #36497 in `sgl-project/sglang`. It is not on `main`. |
 | Size | 34 files changed, 4155 insertions(+), 89 deletions(-) (`git diff --stat HEAD`); 5439 lines, 251,796 bytes |
-| New files | 7 (`new file mode` headers): `expert_stream.py` (already staged as added in the tree) plus the six untracked modules listed in section 3 |
+| New files | 7 (`new file mode` headers): `expert_stream.py` plus the six modules listed in section 3 |
 | SHA-256 | `92f669b2525f9c86190825390fafc2b41a28071c398fcb7fd95716fbce744bb5` |
 | Supersedes | `patches/base/sglang-qwen4exp-2bit.patch` (the pre-campaign baseline: 15 files, 604 lines) |
+| Review form | `upstream/series-q4head/` (on `78c5024e9d`, the head of `qwen4-main-squashed`) and `upstream/series-base/` (on `73a255206f`): the same change split into five commits without the measurement and debug hooks, with registered unit tests |
 
-It contains everything in the tree, i.e. also two measurement-only hooks and the opt-in NGRAM
-edits. Section 5 lists their hunks so an upstreamer can drop them; section 2 shows that the
+It contains everything in the served tree, i.e. also two measurement-only hooks and the opt-in
+NGRAM edits. Section 5 lists their hunks (the series drops them); section 2 shows that the
 patch reproduces the served tree byte for byte.
 
 ## 2. How the patch was produced and verified

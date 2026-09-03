@@ -1,0 +1,888 @@
+From 80b055f6fed7b15841f94cd7100db575b47321c1 Mon Sep 17 00:00:00 2001
+From: Maximilian Roland Haberstroh <info@haberstroh-systems.de>
+Date: Thu, 3 Sep 2026 09:03:06 +0200
+Subject: [PATCH 1/5] fix(qwen4): CPU-offload correctness, breakable graphs,
+ mmap PLE table
+
+## Motivation
+
+Qwen3.8-Flash-Next (Qwen4-Exp: 176B total / 6B active, 48 layers =
+36 GatedDeltaNet + 12 Qwen sparse attention, 512 experts top-10, a 51 GB
+PLE n-gram embedding table) only fits a 24 GB card with `--cpu-offload-gb`.
+On the base commit that path does not work: weight loading fails on a
+device mismatch in `GemmaRMSNorm`, `functional_call` rejects the tied
+`A_log` tensors, the GDN convolution reads a stale `.view()` of a
+parameter whose `.data` the offloader has replaced (GDN output exactly
+zero, NaN logits), checkpoints saved through transformers carry the layer
+type `qwen_sparse_attention`, the fused `in_proj_ba` lands at the wrong bit
+width because `packed_modules_mapping` never reaches the quant config, and
+the PLE table is allocated in full (51.2 GB as fp8, 51,200,245,760 B;
+102.4 GB if materialised as bf16, derived as 2 x 51,200,245,760 B) before
+any offload can act. These are the nine findings of `WRITEUP.md` section 3
+("Nine findings in SGLang"), with finding 8 (the silent NaN) analysed in
+section 4 and finding 9 (26 GB of PCIe traffic per token) in section 5.
+
+The reference machine is one RTX PRO 4000 Blackwell (24 GB, sm_120) with
+32 GB host RAM, serving a 2.572 bpw AutoRound checkpoint (model card,
+"Quantization").
+
+Measurements and logs: https://github.com/HaberstrohSystems/qwen3.8-flash-next-24gb-sglang
+(`docs/CAMPAIGN.md`, an append-only log cited below by its dated entries;
+`docs/ELASTIC_MEMORY.md`; `docs/WRITEUP.md`; `docs/DECODE_PERF_PLAN.md`;
+`tools/bench_speed.py`) and the model card
+https://huggingface.co/HaberstrohSystems/Qwen3.8-Flash-Next-int2-mixed-AutoRound-24GB-SGLang
+(cited by section name).
+
+## Modifications
+
+Correctness under `--cpu-offload-gb` (general, not Qwen4-specific):
+
+* `layers/layernorm.py`: `GemmaRMSNorm` re-derives `gemma_weight` on the
+  device of the parameter (`_weight_loader`) and of the input
+  (`_gemma_weight_for`); the non-persistent buffer was left on the GPU
+  while the parameter went to the CPU.
+* `utils/offloader.py`: `functional_call(..., tie_weights=False)` in both
+  hook variants; `_CpuParamOffloader` keeps a hard reference to the pinned
+  host storage (`cpu_data`). With `SGLANG_MOE_EXPERT_STREAM=1` only expert
+  tensors (`w13_qweight`, `w2_qweight`, `w13_scales`, `w2_scales`,
+  `w13_qzeros`, `w2_qzeros`) are offloaded, and the forward hook is not
+  installed when every offloaded parameter of a module is a streamed expert
+  parameter (the hook would reparametrize the module with tensors that are
+  already on the device). The streamer itself is part 2 of this series.
+* `layers/radix_linear_attention.py`, `models/qwen3_5.py`: the GDN module
+  passes its `nn.Conv1d` instead of a `.view()` of its weight;
+  `RadixLinearAttention.conv_weights` is a property that builds the 2D view
+  from the current parameter on every access. Tensors and tuples pass
+  through unchanged, so KDA / ShortConv / Lightning are not affected.
+
+Qwen4-Exp specific:
+
+* `models/qwen4_exp.py`: accept the layer type `qwen_sparse_attention`
+  (transformers renames `full_attention` on load; loading otherwise fails
+  with `KeyError: 'qwen_sparse_attention'`). The matching
+  `layers_block_type` alias in `configs/qwen4_exp.py` is already on
+  `qwen4-main-squashed` since #36772 and is not repeated here;
+  `Qwen4ExpForConditionalGeneration.__init__` calls
+  `quant_config.update_packed_modules_mapping(...)` like `deepseek_v2.py`
+  does for Quark.
+* `server_args.py`: `Qwen4ExpForConditionalGeneration` in
+  `LANGUAGE_MODEL_ONLY_ARCHITECTURES` (the class inherits the
+  `language_model_only` implementation from `Qwen3VLForConditionalGeneration`;
+  only the entry was missing). Saves the vision tower (0.84 GiB) and the
+  multimodal reservation in the KV budget for text-only serving.
+* `models/qwen4_exp.py`: `Qwen4ExpMmapEmbedding` serves the PLE table from
+  a memory-mapped file (`SGLANG_QWEN4_PLE_MMAP=<dir>` with `ple.f8_e4m3.bin`
+  and `ple.json`; `ple.json` carries `file`, `rows`, `dim`, `dtype` and
+  `weight_scale`, the file is `rows x dim x itemsize` bytes and is checked).
+  The `VocabParallelEmbedding` is created on the `meta` device in that mode
+  so nothing is allocated first. Decode fetches its rows with parallel
+  `os.pread` (16 threads, GIL released; the numpy fancy-index into the
+  memmap held the GIL for the whole cold row fetch, measured at 2.56-3.09
+  ms per token; `DECODE_PERF_PLAN.md`, "2. Parallelise the PLE row
+  fetch"), bulk gathers go through the memmap. `MADV_RANDOM` on the
+  mapping and `POSIX_FADV_RANDOM` on the fd stop the page-cache
+  read-around per 160-byte row (`CAMPAIGN.md` 2026-09-02 14:12);
+  `POSIX_FADV_DONTNEED` after bulk gathers of >= 512 ids drops the pages
+  again (random text otherwise churns ~1M page-cache pages per long
+  prompt; `ELASTIC_MEMORY.md`, "What the reference host taught").
+* `models/qwen4_exp.py`: `Qwen4ExpMmapEmbedding.forward` is wrapped with
+  `eager_on_graph(True)`, so decode runs under
+  `--cuda-graph-backend-decode breakable` with the PLE lookup as the one
+  eager break.
+* `model_executor/runner_backend/breakable_cuda_graph_backend.py`: the four
+  output-structure helpers understand the `LogitsProcessorOutput`
+  dataclass; capture died with "Unsupported BCG output type" for any graph
+  body that returns it.
+* `layers/attention/qsa/qsa_indexer.py`: `_qsa_ensure_rope` hoists the
+  `positions.max().item()` device sync (once per QSA layer, 12 per token;
+  `DECODE_PERF_PLAN.md`, "5. Two micro-fixes") and pre-sizes the rotary
+  cos/sin cache from `context_length`.
+* `mem_cache/memory_pool.py`: fp8 write path in both `set_kv_buffer`
+  variants skips the no-op `div_` by a unit scale and saturates to +-448
+  before the e4m3 cast (the fp32/bf16 -> e4m3fn cast returns NaN beyond
+  the range). Consumed by the fp8 read path of part 4.
+
+No new server flags; the two switches are `SGLANG_MOE_EXPERT_STREAM` and
+`SGLANG_QWEN4_PLE_MMAP`. No tests are added in this part.
+
+## Accuracy Tests
+
+Exactness oracle: teacher-forced logprobs on a fixed 10k-token prompt,
+mean and max |dlogprob| per token against the previous configuration;
+noise floor mean 0.002, threshold for host-side changes mean <= 0.01,
+max <= 0.5 (model card, "Serving fidelity"; `CAMPAIGN.md` 2026-09-02
+11:25).
+
+* Host fixes (offloader hook skip, indexer hoist, PLE pread; together with
+  the streamer items of part 2): oracle max 0.078 / mean 0.0019, equivalent
+  (`CAMPAIGN.md` 2026-09-02 09:30).
+* Breakable decode graphs + `LogitsProcessorOutput` support: oracle max
+  0.079 / mean 0.0022, equivalent (`CAMPAIGN.md` 2026-09-02 11:48).
+* PLE page-cache fixes involve no numerics; the 248k-token needle test on
+  the same server retrieved 5/5 codes after the page-drop fix
+  (`CAMPAIGN.md` 2026-09-02 20:00).
+* fp8 KV write path: a 1-token prompt still crashes in the QSA indexer
+  prefill in `fp8_e4m3` mode; >= 101-token prompts work (`CAMPAIGN.md`
+  2026-09-02 15:26). Open issue, documented here.
+
+## Speed Tests and Profiling
+
+Streaming bench (`tools/bench_speed.py`, 200 streamed tokens, single
+request, ~10k context; model card, "Performance"):
+
+* host fixes: decode 15.4 -> 19.4 tok/s (`CAMPAIGN.md` 2026-09-02 09:30;
+  includes the streamer items of part 2);
+* breakable decode graphs: decode 21.8 -> 40.0 tok/s at prefill 2249
+  tok/s, graph capture 3.97 s / 0.12 GB (`CAMPAIGN.md` 2026-09-02 11:33
+  and 11:48);
+* fp8 write path: `fp8_e4m3` mode at parity with bf16, decode 55.9-57.2 /
+  prefill 2303-2339 tok/s (`CAMPAIGN.md` 2026-09-02 15:12);
+* PLE read-around: before `MADV_RANDOM` / `POSIX_FADV_RANDOM` long
+  prompts (~55k tokens) drove host memory pressure past systemd-oomd
+  (`CAMPAIGN.md` 2026-09-02 14:12); the 248k random-text needle run
+  survived only after `POSIX_FADV_DONTNEED` (2026-09-02 19:37 and 20:00).
+
+Part 1/5 of the Qwen3.8-Flash-Next 24 GB serving series. The series is
+based on 73a255206f, the first commit of the branch qwen4-main-squashed
+(PR #36497); there is no part 0.
+---
+ .../srt/layers/attention/qsa/qsa_indexer.py   |  25 +-
+ python/sglang/srt/layers/layernorm.py         |  26 +-
+ .../srt/layers/radix_linear_attention.py      |  18 +-
+ python/sglang/srt/mem_cache/memory_pool.py    |  26 +-
+ .../breakable_cuda_graph_backend.py           |  37 +++
+ python/sglang/srt/models/qwen3_5.py           |  10 +-
+ python/sglang/srt/models/qwen4_exp.py         | 226 +++++++++++++++++-
+ python/sglang/srt/server_args.py              |  10 +-
+ python/sglang/srt/utils/offloader.py          |  78 +++++-
+ 9 files changed, 423 insertions(+), 33 deletions(-)
+
+diff --git a/python/sglang/srt/layers/attention/qsa/qsa_indexer.py b/python/sglang/srt/layers/attention/qsa/qsa_indexer.py
+index a2e47b5422..36873c3b4c 100644
+--- a/python/sglang/srt/layers/attention/qsa/qsa_indexer.py
++++ b/python/sglang/srt/layers/attention/qsa/qsa_indexer.py
+@@ -23,6 +23,25 @@ from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
+ from sglang.srt.layers.utils import MultiPlatformOp
+ from sglang.srt.model_executor.runner import get_is_capture_mode
+ 
++
++def _qsa_ensure_rope(rotary_emb, positions):
++    """Grow the cos/sin cache without a device sync on the hot path.
++
++    positions.max().item() synchronizes the device once per QSA layer. The
++    cache only ever needs to reach the server context length, so size it to
++    that once (a Python-side comparison afterwards) and fall back to the
++    synchronizing path only if a position somehow exceeds it.
++    """
++    from sglang.srt.server_args import get_global_server_args
++
++    ctx = int(getattr(get_global_server_args(), "context_length", 0) or 0)
++    if ctx > 0:
++        if int(rotary_emb.cos_sin_cache.shape[0]) <= ctx:
++            rotary_emb._ensure_cos_sin_cache_length(ctx)
++        return
++    rotary_emb._ensure_cos_sin_cache_length(int(positions.max().item()))
++
++
+ # Bound the dominant FP32 [query_rows, compressed_keys] prefill workspace.
+ # Top-k is row-independent, so large scheduler chunks can be scored in smaller
+ # row tiles without changing the selected blocks.
+@@ -181,9 +200,7 @@ class QSAIndexer(MultiPlatformOp):
+             if not get_is_capture_mode() and hasattr(
+                 self.rotary_emb, "_ensure_cos_sin_cache_length"
+             ):
+-                self.rotary_emb._ensure_cos_sin_cache_length(
+-                    int(positions.max().item())
+-                )
++                _qsa_ensure_rope(self.rotary_emb, positions)
+             key_state_buffer = pool.get_qsa_key_state_buffer(self.layer_id)
+             q = qsa_index_q_norm_rope_store(
+                 qk,
+@@ -415,7 +432,7 @@ class QSAIndexer(MultiPlatformOp):
+         if not get_is_capture_mode() and hasattr(
+             self.rotary_emb, "_ensure_cos_sin_cache_length"
+         ):
+-            self.rotary_emb._ensure_cos_sin_cache_length(int(positions.max().item()))
++            _qsa_ensure_rope(self.rotary_emb, positions)
+ 
+         # Let the exact Qwen4-Exp RoPE instance compose regular or three-axis
+         # multimodal positions.  Its public cache view repeats cos/sin to the
+diff --git a/python/sglang/srt/layers/layernorm.py b/python/sglang/srt/layers/layernorm.py
+index c2a0ba5f72..5e96ae6c21 100644
+--- a/python/sglang/srt/layers/layernorm.py
++++ b/python/sglang/srt/layers/layernorm.py
+@@ -1021,9 +1021,27 @@ class GemmaRMSNorm(BaseFusedOp):
+     def _weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+         assert param.size() == loaded_weight.size()
+         param.data.copy_(loaded_weight)
++        # gemma_weight is a non-persistent buffer, so it is NOT moved along
++        # when --cpu-offload-gb places the parameter on the CPU. Without this
++        # check, weight loading fails with
++        #   RuntimeError: Expected all tensors to be on the same device,
++        #   but found at least two devices, cuda:0 and cpu!
++        if self.gemma_weight.device != param.data.device:
++            self.gemma_weight = torch.empty_like(param.data)
+         # Keep storage stable for CUDA graphs or fused paths that capture this buffer.
+         torch.add(param.data, 1.0, out=self.gemma_weight)
+ 
++    def _gemma_weight_for(self, ref: torch.Tensor) -> torch.Tensor:
++        """gemma_weight on the device of ``ref``.
++
++        The offloader brings the parameter back to the GPU for the forward
++        pass but not the buffer. Without offload this is a plain comparison
++        with no copy.
++        """
++        if self.gemma_weight.device != ref.device:
++            self.gemma_weight = self.weight.data.to(ref.device) + 1.0
++        return self.gemma_weight
++
+     def _forward_impl(
+         self,
+         x: torch.Tensor,
+@@ -1097,7 +1115,7 @@ class GemmaRMSNorm(BaseFusedOp):
+             # keep Gemma RMSNorm on native torch math for correctness.
+             return self.forward_native(x, residual, post_residual_addition)
+         else:
+-            w = self.gemma_weight
++            w = self._gemma_weight_for(x)
+             # vllm API: rms_norm(out, input, weight, eps) -> None (in-place)
+             #           fused_add_rms_norm(out, input, residual_out, residual, weight, eps)
+             if not x.is_contiguous():
+@@ -1146,7 +1164,7 @@ class GemmaRMSNorm(BaseFusedOp):
+             if post_residual_addition is not None:
+                 residual = residual + post_residual_addition
+             if x.shape[-1] > _NPU_GEMMA_RMS_NORM_TRITON_MAX_HIDDEN_SIZE:
+-                gamma = self.gemma_weight.to(x.dtype)
++                gamma = self._gemma_weight_for(x).to(x.dtype)
+                 norm_out, _, residual = torch_npu.npu_add_rms_norm(
+                     residual, x, gamma, self.variance_epsilon
+                 )
+@@ -1190,7 +1208,7 @@ class GemmaRMSNorm(BaseFusedOp):
+             x,
+             residual,
+             post_residual_addition,
+-            self.gemma_weight,
++            self._gemma_weight_for(x),
+             use_attn_tp_group=True,
+         )
+ 
+@@ -1207,7 +1225,7 @@ class GemmaRMSNorm(BaseFusedOp):
+             self,
+             x,
+             residual,
+-            self.gemma_weight,
++            self._gemma_weight_for(x),
+             group_size,
+             use_attn_tp_group,
+             keep_bf16,
+diff --git a/python/sglang/srt/layers/radix_linear_attention.py b/python/sglang/srt/layers/radix_linear_attention.py
+index 2dfc00d791..87d8b9671c 100644
+--- a/python/sglang/srt/layers/radix_linear_attention.py
++++ b/python/sglang/srt/layers/radix_linear_attention.py
+@@ -68,7 +68,7 @@ class RadixLinearAttention(nn.Module):
+         self.k_dim = num_k_heads * head_k_dim
+         self.v_dim = num_v_heads * head_v_dim
+ 
+-        self.conv_weights = conv_weights
++        self._conv_source = conv_weights
+         self.bias = bias
+         self.activation = activation
+ 
+@@ -76,6 +76,22 @@ class RadixLinearAttention(nn.Module):
+         self.dt_bias = dt_bias
+         self.lower_bound = None
+ 
++    @property
++    def conv_weights(self):
++        """Convolution weights, derived fresh on every access.
++
++        When an nn.Module (nn.Conv1d) is passed, the 2D view is built from the
++        CURRENT parameter. This is required because --cpu-offload-gb replaces
++        param.data; a view stored once then points at stale memory. Tensors
++        and tuples pass through unchanged so other models (KDA, ShortConv,
++        Lightning) are unaffected.
++        """
++        src = self._conv_source
++        if isinstance(src, nn.Module):
++            w = src.weight
++            return w.view(w.size(0), w.size(2))
++        return src
++
+     def forward(
+         self,
+         forward_batch: ForwardBatch,
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+index 64ed0cf254..7d8b27ede2 100644
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -2473,10 +2473,19 @@ class MHATokenToKVPool(KVCache):
+             return
+ 
+         if cache_k.dtype != self.dtype:
+-            if k_scale is not None:
++            if k_scale is not None and not (
++                isinstance(k_scale, (int, float)) and k_scale == 1
++            ):
+                 cache_k.div_(k_scale)
+-            if v_scale is not None:
++            if v_scale is not None and not (
++                isinstance(v_scale, (int, float)) and v_scale == 1
++            ):
+                 cache_v.div_(v_scale)
++            if (
++                self.dtype == torch.float8_e4m3fn
++            ):  # fp32/bf16 -> e4m3fn returns NaN beyond +-448
++                cache_k = cache_k.clamp(-448.0, 448.0)
++                cache_v = cache_v.clamp(-448.0, 448.0)
+             cache_k = cache_k.to(self.dtype)
+             cache_v = cache_v.to(self.dtype)
+ 
+@@ -2846,10 +2855,19 @@ class MHATokenToKVPool(KVCache):
+             )
+ 
+         if cache_k.dtype != self.dtype:
+-            if k_scale is not None:
++            if k_scale is not None and not (
++                isinstance(k_scale, (int, float)) and k_scale == 1
++            ):
+                 cache_k.div_(k_scale)
+-            if v_scale is not None:
++            if v_scale is not None and not (
++                isinstance(v_scale, (int, float)) and v_scale == 1
++            ):
+                 cache_v.div_(v_scale)
++            if (
++                self.dtype == torch.float8_e4m3fn
++            ):  # fp32/bf16 -> e4m3fn returns NaN beyond +-448
++                cache_k = cache_k.clamp(-448.0, 448.0)
++                cache_v = cache_v.clamp(-448.0, 448.0)
+             cache_k = cache_k.to(self.dtype)
+             cache_v = cache_v.to(self.dtype)
+ 
+diff --git a/python/sglang/srt/model_executor/runner_backend/breakable_cuda_graph_backend.py b/python/sglang/srt/model_executor/runner_backend/breakable_cuda_graph_backend.py
+index c4fc865327..e9abaf56ab 100644
+--- a/python/sglang/srt/model_executor/runner_backend/breakable_cuda_graph_backend.py
++++ b/python/sglang/srt/model_executor/runner_backend/breakable_cuda_graph_backend.py
+@@ -142,6 +142,15 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
+         # CUDA graphs retain tensor addresses, not Python tensor lifetimes.
+         self._capture_inputs[shape_key] = capture_inputs
+ 
++    @staticmethod
++    def _lpo_fields(output):
++        """(name, tensor) pairs of the tensor-valued fields of a LogitsProcessorOutput."""
++        return [(k, v) for k, v in vars(output).items() if torch.is_tensor(v)]
++
++    @staticmethod
++    def _is_lpo(output) -> bool:
++        return type(output).__name__ == "LogitsProcessorOutput"
++
+     def _output_rows(self, output: Any, cap: int) -> int:
+         """Leading-dim row count actually produced by the body, clamped to ``cap``.
+ 
+@@ -155,6 +164,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
+             return min([cap, *rows])
+         if isinstance(output, (list, tuple)) and output:
+             return min(self._output_rows(o, cap) for o in output if o is not None)
++        if self._is_lpo(output):
++            rows = [t.shape[0] for _, t in self._lpo_fields(output)]
++            return min([cap, *rows]) if rows else cap
+         return cap
+ 
+     def _alloc_full_buffer(self, output: Any, size: int) -> Any:
+@@ -174,6 +186,13 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
+             return tuple(self._alloc_full_buffer(o, size) for o in output)
+         if isinstance(output, list):
+             return [self._alloc_full_buffer(o, size) for o in output]
++        if self._is_lpo(output):
++            import copy as _copy
++
++            buf = _copy.copy(output)
++            for k, t in self._lpo_fields(output):
++                setattr(buf, k, t.new_empty((size, *t.shape[1:])))
++            return buf
+         raise TypeError(f"Unsupported BCG output type: {type(output)}")
+ 
+     def _slice_output(self, output: Any, num_tokens: int) -> Any:
+@@ -187,6 +206,13 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
+             return tuple(self._slice_output(item, num_tokens) for item in output)
+         if isinstance(output, list):
+             return [self._slice_output(item, num_tokens) for item in output]
++        if self._is_lpo(output):
++            import copy as _copy
++
++            out = _copy.copy(output)
++            for k, t in self._lpo_fields(output):
++                setattr(out, k, t[:num_tokens])
++            return out
+         raise TypeError(f"Unsupported BCG output type: {type(output)}")
+ 
+     def _copy_output_to_buffer(
+@@ -202,6 +228,17 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
+         if torch.is_tensor(output) and torch.is_tensor(output_buffer):
+             output_buffer[:num_tokens].copy_(output[:num_tokens])
+             return
++        if self._is_lpo(output) and self._is_lpo(output_buffer):
++            for k, t in self._lpo_fields(output):
++                b = getattr(output_buffer, k, None)
++                if torch.is_tensor(b):
++                    b[:num_tokens].copy_(t[:num_tokens])
++                else:
++                    setattr(output_buffer, k, t)
++            for k, v in vars(output).items():
++                if not torch.is_tensor(v):
++                    setattr(output_buffer, k, v)
++            return
+         if isinstance(output, PPProxyTensors) and isinstance(
+             output_buffer, PPProxyTensors
+         ):
+diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
+index 1f447f27c6..54ba5bb1ba 100644
+--- a/python/sglang/srt/models/qwen3_5.py
++++ b/python/sglang/srt/models/qwen3_5.py
+@@ -345,9 +345,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+         set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
+         set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+ 
+-        conv_weights = self.conv1d.weight.view(
+-            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+-        )
++        # Pass the module, NOT a view: --cpu-offload-gb replaces param.data
++        # on every on/offload, so a .view() taken at construction time ends up
++        # pointing at old, uninitialized memory. Symptom: conv_weights with
++        # magnitudes around 1e-38, GDN output exactly zero, NaN logits. This
++        # never shows on datacenter GPUs, where nobody needs offload.
++        # RadixLinearAttention now derives the view fresh on each access.
++        conv_weights = self.conv1d
+         self.attn = RadixLinearAttention(
+             layer_id=layer_id,
+             num_q_heads=self.num_k_heads // self.attn_tp_size,
+diff --git a/python/sglang/srt/models/qwen4_exp.py b/python/sglang/srt/models/qwen4_exp.py
+index 93b552ee1c..6060b58263 100644
+--- a/python/sglang/srt/models/qwen4_exp.py
++++ b/python/sglang/srt/models/qwen4_exp.py
+@@ -1,6 +1,8 @@
+ """Inference-only Qwen4-Exp (text + VL) on the Qwen3.5 backbone."""
+ 
++import json
+ import math
++import os
+ from contextlib import nullcontext
+ from typing import Any, Iterable, Optional, Set, Tuple
+ 
+@@ -488,18 +490,25 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+             and get_attention_dp_size() > 1
+             and not self.use_attn_tp_ngram
+         )
+-        self.ngram_embedding = VocabParallelEmbedding(
+-            padded_vocab_size,
+-            self.head_dim_per_ngram,
+-            params_dtype=(
+-                torch.float8_e4m3fn
+-                if (quant_config is not None and quant_config.get_name() == "fp8")
+-                or getattr(config, "ple_embedding_dtype", None) == "float8_e4m3fn"
+-                else torch.bfloat16
+-            ),
+-            output_dtype=torch.bfloat16,
+-            use_attn_tp_group=self.use_attn_tp_ngram,
+-        )
++        # In mmap mode, create the table on "meta": it then costs no memory
++        # and is replaced by Qwen4ExpMmapEmbedding immediately afterwards.
++        # Without this, 51.2 GB (fp8) or 97.7 GB (bf16) would be allocated
++        # here before any offload can take effect.
++        _ple_mmap_dir = os.environ.get("SGLANG_QWEN4_PLE_MMAP")
++        _alloc_ctx = torch.device("meta") if _ple_mmap_dir else nullcontext()
++        with _alloc_ctx:
++            self.ngram_embedding = VocabParallelEmbedding(
++                padded_vocab_size,
++                self.head_dim_per_ngram,
++                params_dtype=(
++                    torch.float8_e4m3fn
++                    if (quant_config is not None and quant_config.get_name() == "fp8")
++                    or getattr(config, "ple_embedding_dtype", None) == "float8_e4m3fn"
++                    else torch.bfloat16
++                ),
++                output_dtype=torch.bfloat16,
++                use_attn_tp_group=self.use_attn_tp_ngram,
++            )
+         self.ngram_embedding.register_buffer(
+             "weight_scale", torch.ones(1, dtype=torch.bfloat16), persistent=True
+         )
+@@ -747,6 +756,163 @@ def _gather_ple_embedding_from_pinned_kernel(
+     )
+ 
+ 
++class Qwen4ExpMmapEmbedding(nn.Module):
++    """PLE table read from NVMe via mmap, without pinned host memory.
++
++    Why this exists: Qwen4ExpPinnedHostEmbedding places the full table in
++    page-locked host memory. For Qwen3.8-Flash-Next that is 51.2 GB (fp8) or
++    97.7 GB (bf16) - impossible on a 30 GiB machine, and the table has already
++    been allocated once by VocabParallelEmbedding before that.
++
++    This variant allocates nothing. It reads the required rows from a mapped
++    file on each access; the kernel page cache handles reloads from SSD.
++    Measured: 16 rows per token, 2560 bytes - negligible for an NVMe.
++
++    Enabled via SGLANG_QWEN4_PLE_MMAP, pointing at the directory holding
++    ple.f8_e4m3.bin and ple.json. weight_scale lives in ple.json because it no
++    longer survives into the quantized checkpoint.
++    """
++
++    _COPIED = (
++        "quant_config",
++        "enable_tp",
++        "use_attn_tp_group",
++        "tp_size",
++        "num_embeddings",
++        "org_vocab_size",
++        "padding_size",
++        "num_added_embeddings",
++        "use_presharded_weights",
++        "org_vocab_size_padded",
++        "num_embeddings_padded",
++        "shard_indices",
++        "embedding_dim",
++        "num_embeddings_per_partition",
++        "num_org_embeddings_per_partition",
++        "num_added_embeddings_per_partition",
++    )
++
++    _DTYPES = {
++        "F8_E4M3": torch.float8_e4m3fn,
++        "BF16": torch.bfloat16,
++    }
++
++    def __init__(self, embedding: VocabParallelEmbedding, directory: str) -> None:
++        nn.Module.__init__(self)
++        import numpy as np
++
++        for name in self._COPIED:
++            setattr(self, name, getattr(embedding, name))
++        self.quant_method = None
++
++        meta = json.load(open(os.path.join(directory, "ple.json")))
++        path = os.path.join(directory, meta["file"])
++        self._rows = int(meta["rows"])
++        self._dim = int(meta["dim"])
++        self._dtype = self._DTYPES[meta["dtype"]]
++        itemsize = torch.empty(0, dtype=self._dtype).element_size()
++        expected = self._rows * self._dim * itemsize
++        actual = os.path.getsize(path)
++        if actual != expected:
++            raise ValueError(
++                f"{path}: {actual} bytes, expected {expected} "
++                f"({self._rows} x {self._dim} x {itemsize})"
++            )
++        if self._dim != self.embedding_dim:
++            raise ValueError(
++                f"ple.json dim={self._dim} does not match embedding_dim="
++                f"{self.embedding_dim}"
++            )
++        # uint8 view: numpy has no fp8; torch reinterprets it later.
++        self._mm = np.memmap(
++            path, dtype=np.uint8, mode="r", shape=(self._rows, self._dim * itemsize)
++        )
++        try:  # rows are 160 B at random offsets: no read-around
++            import mmap as _mmap
++
++            self._mm._mmap.madvise(_mmap.MADV_RANDOM)
++        except Exception as _ex:  # pragma: no cover
++            logger.warning("Qwen4 PLE: madvise(MADV_RANDOM) failed: %s", _ex)
++        self._itemsize = itemsize
++        # Parallel pread path for decode: one 160-byte read per row, GIL released.
++        self._fd = os.open(path, os.O_RDONLY)
++        try:
++            os.posix_fadvise(self._fd, 0, 0, os.POSIX_FADV_RANDOM)
++        except Exception as _ex:  # pragma: no cover
++            logger.warning("Qwen4 PLE: posix_fadvise(RANDOM) failed: %s", _ex)
++        from concurrent.futures import ThreadPoolExecutor
++
++        self._pool = ThreadPoolExecutor(max_workers=16)
++        self._row_bytes = self._dim * itemsize
++
++        scale = torch.tensor([float(meta["weight_scale"])], dtype=torch.bfloat16)
++        self.register_buffer("weight_scale", scale, persistent=True)
++        if hasattr(embedding, "weight"):
++            del embedding.weight
++        logger.info(
++            "Qwen4 PLE: mmap from %s (%d rows x %d, %s, %.2f GB) - "
++            "no pinned host memory",
++            path,
++            self._rows,
++            self._dim,
++            meta["dtype"],
++            actual / 1e9,
++        )
++
++    def allocate_output(self, shape, device: torch.device) -> torch.Tensor:
++        with torch.inference_mode(False):
++            return torch.empty(shape, dtype=torch.bfloat16, device=device)
++
++    def gather(
++        self, input_ids: torch.Tensor, out: Optional[torch.Tensor] = None
++    ) -> torch.Tensor:
++        expected_shape = (*input_ids.shape, self.embedding_dim)
++        output = (
++            self.allocate_output(expected_shape, input_ids.device)
++            if out is None
++            else out
++        )
++        flat = input_ids.reshape(-1)
++        if not flat.numel():
++            return output
++        start = self.shard_indices.org_vocab_start_index
++        end = self.shard_indices.org_vocab_end_index
++        ids = flat.to("cpu", torch.int64)
++        inside = (ids >= start) & (ids < end)
++        local = torch.where(inside, ids - start, torch.zeros_like(ids))
++        if local.numel() <= 64:
++            rb = self._row_bytes
++
++            def _rd(r):
++                return os.pread(self._fd, rb, int(r) * rb)
++
++            buf = b"".join(self._pool.map(_rd, local.tolist()))
++            rows = torch.frombuffer(bytearray(buf), dtype=torch.uint8).view(-1, rb)
++        else:
++            rows = torch.from_numpy(self._mm[local.numpy()])  # uint8, (N, dim*b)
++            if local.numel() >= 512:
++                try:
++                    os.posix_fadvise(self._fd, 0, 0, os.POSIX_FADV_DONTNEED)
++                except Exception:  # pragma: no cover
++                    pass
++        vals = rows.view(self._dtype).to(torch.bfloat16)  # (N, dim)
++        vals = torch.where(
++            inside.unsqueeze(1), vals, torch.zeros((), dtype=torch.bfloat16)
++        )
++        output.copy_(vals.reshape(expected_shape).to(output.device, non_blocking=True))
++        return output
++
++    def reduce(self, output: torch.Tensor) -> torch.Tensor:
++        if self.tp_size > 1 and not get_attn_tp_context().input_scattered:
++            if self.use_attn_tp_group:
++                return attn_tp_all_reduce(output)
++            return tensor_model_parallel_all_reduce(output)
++        return output
++
++    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
++        return self.reduce(self.gather(input_ids))
++
++
+ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
+     """PLE table read directly from pinned host memory.
+ 
+@@ -891,7 +1057,12 @@ class Qwen4ExpPLELayer(nn.Module):
+             ple_layer_index=ple_layer_index,
+             quant_config=quant_config,
+         )
+-        if config.ple_offload_embedding:
++        _ple_mmap_dir = os.environ.get("SGLANG_QWEN4_PLE_MMAP")
++        if _ple_mmap_dir:
++            self.ple_embedding.ngram_embedding = Qwen4ExpMmapEmbedding(
++                self.ple_embedding.ngram_embedding, _ple_mmap_dir
++            )
++        elif config.ple_offload_embedding:
+             self.ple_embedding.ngram_embedding = Qwen4ExpPinnedHostEmbedding(
+                 self.ple_embedding.ngram_embedding
+             )
+@@ -1576,6 +1747,13 @@ class Qwen4ExpAttentionDecoderLayer(
+ ALL_DECODER_LAYER_TYPES = {
+     "attention": Qwen4ExpAttentionDecoderLayer,
+     "full_attention": Qwen4ExpAttentionDecoderLayer,
++    # transformers renames "full_attention" to "qwen_sparse_attention" on
++    # load, because those layers actually use an indexer
++    # (configuration_qwen4_exp.py). Every checkpoint saved through
++    # transformers - after quantization, for instance - therefore carries this
++    # name. Without the entry, loading fails with
++    # KeyError: 'qwen_sparse_attention'.
++    "qwen_sparse_attention": Qwen4ExpAttentionDecoderLayer,
+     "linear_attention": Qwen4ExpLinearDecoderLayer,
+ }
+ 
+@@ -1724,6 +1902,17 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
+         prefix: str = "",
+         language_model_cls=Qwen4ExpVLModel,
+     ) -> None:
++        # Without this line AutoRoundConfig.packed_modules_mapping stays
++        # empty and get_layer_config() cannot map fused names back to their
++        # parts. Concretely: in_proj_ba = in_proj_b (48) + in_proj_a (48).
++        # Both are bf16 in the checkpoint, but the fused name only matches the
++        # general regex and lands at 8 bits ->
++        #   gptq_marlin_repack.cuh: size_n = 96 is not divisible by tile_n_size = 64
++        # deepseek_v2.py does the same (there for Quark).
++        if quant_config is not None and hasattr(
++            quant_config, "update_packed_modules_mapping"
++        ):
++            quant_config.update_packed_modules_mapping(self.packed_modules_mapping)
+         super().__init__(config, quant_config, prefix, language_model_cls)
+         rope_config = getattr(self.config, "rope_parameters", None) or getattr(
+             self.config, "rope_scaling", {}
+@@ -2130,3 +2319,14 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
+ 
+ 
+ EntryClass = [Qwen4ExpForConditionalGeneration]
++
++
++# --- Breakable CUDA Graph: the mmap PLE lookup is the one eager break on the decode path.
++try:
++    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
++        eager_on_graph as _eog,
++    )
++
++    Qwen4ExpMmapEmbedding.forward = _eog(True)(Qwen4ExpMmapEmbedding.forward)
++except Exception as _e:  # pragma: no cover
++    logger.warning("BCG wrap of Qwen4ExpMmapEmbedding.forward failed: %s", _e)
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index ff6169366d..fbb5415bbf 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -7665,7 +7665,15 @@ class ServerArgs:
+         except Exception:
+             return False
+ 
+-    LANGUAGE_MODEL_ONLY_ARCHITECTURES = ("MuseGlimmerForConditionalGeneration",)
++    LANGUAGE_MODEL_ONLY_ARCHITECTURES = (
++        "MuseGlimmerForConditionalGeneration",
++        # Qwen4ExpForConditionalGeneration inherits from
++        # Qwen3VLForConditionalGeneration, where language_model_only is already
++        # implemented (qwen3_vl.py:1243/1309/1441). Only the entry here was
++        # missing. For text-only use this saves the vision tower (0.84 GiB of
++        # weights) plus the multimodal reservation inside the KV budget.
++        "Qwen4ExpForConditionalGeneration",
++    )
+ 
+     def _handle_language_model_only(self):
+         if not self.language_model_only:
+diff --git a/python/sglang/srt/utils/offloader.py b/python/sglang/srt/utils/offloader.py
+index 2e72b3c061..eee94bed9d 100644
+--- a/python/sglang/srt/utils/offloader.py
++++ b/python/sglang/srt/utils/offloader.py
+@@ -111,11 +111,34 @@ class OffloaderV1(BaseOffloader):
+         # offload parameters to CPU
+         # use pin_memory if possible, which helps cudagraph capture speed
+         offloaded_parameters = False
+-        for p in module.parameters():
++        # With MoE expert streaming, offload expert weights only. Everything
++        # else (attention, GDN, norms, hyper-connections) is needed on EVERY
++        # token and belongs on the GPU; experts are needed 10 out of 512 per
++        # token and are fetched selectively. Without this selection the
++        # offloader moves whole layers and keeps transferring their
++        # non-expert part - measured at 4.8 GB per token, which eats the
++        # speedup again.
++        if os.environ.get("SGLANG_MOE_EXPERT_STREAM") == "1":
++            _params = [
++                q for n, q in module.named_parameters() if _is_streamed_expert_param(n)
++            ]
++        else:
++            _params = list(module.parameters())
++        _n_offloaded = 0
++        _n_streamed = 0
++        for p in _params:
+             if self._cpu_offload_bytes >= self._cpu_offload_max_bytes:
+                 # we use per-parameter offloading
+                 # one module might have some parameters offloaded and some not
+                 break
++            _n_offloaded += 1
++            _n_streamed += int(
++                any(
++                    p is q
++                    for n, q in module.named_parameters()
++                    if _is_streamed_expert_param(n)
++                )
++            )
+ 
+             # `torch.empty_like` does not support `pin_memory` argument
+             cpu_data = torch.empty_strided(
+@@ -131,6 +154,12 @@ class OffloaderV1(BaseOffloader):
+             self._cpu_offload_bytes += p.data.numel() * p.data.element_size()
+             offloaded_parameters = True
+ 
++        # When every offloaded parameter is a streamed expert param, the hook
++        # below would build device_state from a state_dict() that EXCLUDES all
++        # of them and reparametrize the module with tensors that are already
++        # on the device. That is pure overhead on every forward - skip it.
++        if offloaded_parameters and _n_offloaded == _n_streamed and _n_streamed > 0:
++            offloaded_parameters = False
+         if offloaded_parameters:
+             original_forward = module.forward
+ 
+@@ -141,8 +170,16 @@ class OffloaderV1(BaseOffloader):
+                     # if the parameter is already on the device, it will be a no-op
+                     k: v.to(device, non_blocking=True)
+                     for k, v in module.state_dict().items()
++                    if not _is_streamed_expert_param(k)
+                 }
+-                output = functional_call(module, device_state, args=args, kwargs=kwargs)
++                # tie_weights=False: the state_dict contains tied tensors
++                # under several names (for Qwen4-Exp e.g. linear_attn.A_log and
++                # linear_attn.attn.A_log). With the default True,
++                # functional_call fails with "got multiple values for keys ...
++                # which are tied".
++                output = functional_call(
++                    module, device_state, args=args, kwargs=kwargs, tie_weights=False
++                )
+                 module.forward = forward
+                 return output
+ 
+@@ -151,6 +188,31 @@ class OffloaderV1(BaseOffloader):
+         return module
+ 
+ 
++_STREAMED_EXPERT_SUFFIXES = (
++    "w13_qweight",
++    "w2_qweight",
++    "w13_scales",
++    "w2_scales",
++    "w13_qzeros",
++    "w2_qzeros",
++)
++
++
++def _is_streamed_expert_param(key: str) -> bool:
++    """Does this state_dict key belong to the streamed MoE experts?
++
++    These tensors must NOT be copied to the GPU wholesale: they are by far the
++    largest item (32 GB), yet only 10 of 512 experts are needed per token. MoE
++    expert streaming fetches them selectively. Without this exclusion ~26 GB
++    move over PCIe per token and the GPU only waits.
++    """
++    if os.environ.get("SGLANG_MOE_EXPERT_STREAM") != "1":
++        return False
++    return ("experts." in key or key.startswith("experts")) and key.rsplit(".", 1)[
++        -1
++    ] in _STREAMED_EXPERT_SUFFIXES
++
++
+ class OffloaderV2(BaseOffloader):
+     def __init__(
+         self,
+@@ -262,8 +324,13 @@ def _hook_module_forward_raw(module, on_forward_end, get_parameter_and_buffer_di
+ 
+     def forward(*args, **kwargs):
+         module.forward = original_forward
++        # see comment above: tied tensors under several names
+         output = functional_call(
+-            module, get_parameter_and_buffer_dicts(), args=args, kwargs=kwargs
++            module,
++            get_parameter_and_buffer_dicts(),
++            args=args,
++            kwargs=kwargs,
++            tie_weights=False,
+         )
+         on_forward_end()
+         module.forward = forward
+@@ -376,6 +443,11 @@ class _CpuParamOffloader(_BaseParamOffloader):
+     def __init__(self, module, param_name):
+         super().__init__(module, param_name)
+         _move_param_to_cpu(self._param, pin_memory=True)
++        # Hard reference to the pinned host storage. Without it the tensor
++        # is only reachable through the module attribute, which functional_call
++        # replaces with the GPU copy. MoE expert streaming needs the original
++        # storage to fetch individual experts.
++        self.cpu_data = self._param.data
+ 
+     def create_device_tensor(self):
+         return self._param.to("cuda", non_blocking=True)
+-- 
+2.43.0
+

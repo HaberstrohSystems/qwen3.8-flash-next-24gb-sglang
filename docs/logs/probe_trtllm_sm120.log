@@ -1,0 +1,4 @@
+batch=1 topk=2051 stride=2112 max_abs_err=5.6800e-04 rel=3.883e-03 nan=False
+batch=4 topk=2051 stride=2112 max_abs_err=4.1540e-03 rel=2.521e-03 nan=False
+batch=3 topk=130 stride=192 max_abs_err=3.1685e-03 rel=2.525e-03 nan=False
+PROBE_OK
